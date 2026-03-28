@@ -1,0 +1,35 @@
+# ECHO Robot - Requirements
+# Install with: pip install -r requirements.txt
+
+# ── Gemini AI ──
+google-genai>=1.0.0
+
+# ── Speech-to-Text (Faster Whisper - optimized for RPi) ──
+faster-whisper>=1.0.0
+
+# ── Audio ──
+pyaudio>=0.2.14
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.10.0
+
+# ── Camera & Vision ──
+opencv-python-headless>=4.8.0
+Pillow>=10.0.0
+
+# ── TFLite Runtime (for Raspberry Pi) ──
+tflite-runtime>=2.14.0
+
+# ── Face Display ──
+pygame>=2.5.0
+
+# ── GPIO (Raspberry Pi) ──
+# RPi.GPIO is pre-installed on Raspberry Pi OS
+# Uncomment below if needed:
+# RPi.GPIO>=0.7.1
+
+# ── Environment variables ──
+python-dotenv>=1.0.0
+
+# ── Utilities ──
+threading-timer-decorator>=1.0.0

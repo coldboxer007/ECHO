@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# TFLite models (large files - keep locally)
+# Uncomment below if you want to track them
+# *.tflite
+
+# Audio files
+*.wav
+*.mp3
+!assets/sounds/*.wav
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
