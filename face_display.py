@@ -92,7 +92,7 @@ class FaceDisplay:
     # ═══════════════════════════════════════════
 
     def _draw_face(self):
-        """Render the current face expression."""
+        """Render the current face expression scaled for display size."""
         if self._screen is None:
             return
 
@@ -110,9 +110,14 @@ class FaceDisplay:
         cx = DISPLAY_WIDTH // 2   # Center X
         cy = DISPLAY_HEIGHT // 2  # Center Y
 
+        # Scale factor relative to original 320x240 design
+        sx = DISPLAY_WIDTH / 320.0
+        sy = DISPLAY_HEIGHT / 240.0
+        s = min(sx, sy)  # Uniform scale
+
         # Breathing animation (subtle scale)
         self._breath_phase += 0.02
-        breath = math.sin(self._breath_phase) * 2
+        breath = math.sin(self._breath_phase) * (3 * s)
 
         # Blink timer
         self._blink_timer += 1 / DISPLAY_FPS
@@ -125,156 +130,208 @@ class FaceDisplay:
         # Talk animation
         if is_talking:
             self._talk_phase += 0.3
-        talk_offset = math.sin(self._talk_phase) * 5 if is_talking else 0
+        talk_offset = math.sin(self._talk_phase) * (8 * s) if is_talking else 0
 
         # Clear screen
         self._screen.fill(bg_color)
 
-        # ── Face background (rounded rect / circle) ──
+        # ── Face background (rounded ellipse) ──
+        fw = int(180 * s)
+        fh = int(160 * s)
         face_rect = pygame.Rect(
-            cx - 90, cy - 80 + breath, 180, 160
+            cx - fw // 2, cy - fh // 2 + breath, fw, fh
         )
         pygame.draw.ellipse(self._screen, face_color, face_rect)
 
         # ── Eyes ──
-        eye_y = cy - 25 + breath
-        left_eye_x = cx - 35
-        right_eye_x = cx + 35
-        eye_w, eye_h = 28, 28
+        eye_y = int(cy - 25 * s + breath)
+        left_eye_x = int(cx - 35 * s)
+        right_eye_x = int(cx + 35 * s)
+
+        # Scaled sizes
+        eye_r = int(13 * s)       # neutral eye radius
+        pupil_r = int(6 * s)      # neutral pupil radius
+        line_w = max(2, int(3 * s))
+        thick_w = max(3, int(4 * s))
 
         if self._is_blinking:
             # Closed eyes — horizontal lines
+            hw = int(14 * s)
             pygame.draw.line(self._screen, pupil_color,
-                             (left_eye_x - 14, eye_y), (left_eye_x + 14, eye_y), 3)
+                             (left_eye_x - hw, eye_y), (left_eye_x + hw, eye_y), line_w)
             pygame.draw.line(self._screen, pupil_color,
-                             (right_eye_x - 14, eye_y), (right_eye_x + 14, eye_y), 3)
+                             (right_eye_x - hw, eye_y), (right_eye_x + hw, eye_y), line_w)
         elif emotion == "happy":
             # Happy eyes — upturned arcs (^  ^)
+            aw = int(28 * s)
+            ah = int(20 * s)
             pygame.draw.arc(self._screen, pupil_color,
-                            (left_eye_x - 14, eye_y - 10, 28, 20),
-                            0, math.pi, 4)
+                            (left_eye_x - aw // 2, eye_y - ah // 2, aw, ah),
+                            0, math.pi, thick_w)
             pygame.draw.arc(self._screen, pupil_color,
-                            (right_eye_x - 14, eye_y - 10, 28, 20),
-                            0, math.pi, 4)
+                            (right_eye_x - aw // 2, eye_y - ah // 2, aw, ah),
+                            0, math.pi, thick_w)
         elif emotion == "sad":
             # Sad eyes — droopy
+            ew = int(24 * s)
+            eh = int(20 * s)
             pygame.draw.ellipse(self._screen, eye_color,
-                                (left_eye_x - 12, eye_y - 8, 24, 20))
+                                (left_eye_x - ew // 2, eye_y - eh // 2, ew, eh))
             pygame.draw.ellipse(self._screen, eye_color,
-                                (right_eye_x - 12, eye_y - 8, 24, 20))
-            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y + 2), 6)
-            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y + 2), 6)
+                                (right_eye_x - ew // 2, eye_y - eh // 2, ew, eh))
+            pr = int(6 * s)
+            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y + int(2 * s)), pr)
+            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y + int(2 * s)), pr)
             # Droopy eyebrows
+            brow_off = int(16 * s)
+            brow_h = int(18 * s)
+            brow_tilt = int(14 * s)
             pygame.draw.line(self._screen, pupil_color,
-                             (left_eye_x - 16, eye_y - 18), (left_eye_x + 12, eye_y - 14), 3)
+                             (left_eye_x - brow_off, eye_y - brow_h),
+                             (left_eye_x + int(12 * s), eye_y - brow_tilt), line_w)
             pygame.draw.line(self._screen, pupil_color,
-                             (right_eye_x - 12, eye_y - 14), (right_eye_x + 16, eye_y - 18), 3)
+                             (right_eye_x - int(12 * s), eye_y - brow_tilt),
+                             (right_eye_x + brow_off, eye_y - brow_h), line_w)
         elif emotion == "angry":
             # Angry eyes — angled brows, narrow
+            ew = int(24 * s)
+            eh = int(16 * s)
             pygame.draw.ellipse(self._screen, eye_color,
-                                (left_eye_x - 12, eye_y - 6, 24, 16))
+                                (left_eye_x - ew // 2, eye_y - eh // 2, ew, eh))
             pygame.draw.ellipse(self._screen, eye_color,
-                                (right_eye_x - 12, eye_y - 6, 24, 16))
-            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), 5)
-            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), 5)
+                                (right_eye_x - ew // 2, eye_y - eh // 2, ew, eh))
+            pr = int(5 * s)
+            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), pr)
+            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), pr)
             # Angry eyebrows \  /
+            b1 = int(16 * s)
+            b2 = int(10 * s)
+            b3 = int(12 * s)
+            b4 = int(20 * s)
             pygame.draw.line(self._screen, pupil_color,
-                             (left_eye_x - 16, eye_y - 12), (left_eye_x + 10, eye_y - 20), 4)
+                             (left_eye_x - b1, eye_y - b3), (left_eye_x + b2, eye_y - b4), thick_w)
             pygame.draw.line(self._screen, pupil_color,
-                             (right_eye_x - 10, eye_y - 20), (right_eye_x + 16, eye_y - 12), 4)
+                             (right_eye_x - b2, eye_y - b4), (right_eye_x + b1, eye_y - b3), thick_w)
         elif emotion == "surprise":
             # Surprise — big round eyes
-            pygame.draw.circle(self._screen, eye_color, (left_eye_x, eye_y), 16)
-            pygame.draw.circle(self._screen, eye_color, (right_eye_x, eye_y), 16)
-            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), 7)
-            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), 7)
+            big_r = int(16 * s)
+            pr = int(7 * s)
+            pygame.draw.circle(self._screen, eye_color, (left_eye_x, eye_y), big_r)
+            pygame.draw.circle(self._screen, eye_color, (right_eye_x, eye_y), big_r)
+            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), pr)
+            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), pr)
             # Raised eyebrows
+            bw = int(36 * s)
+            bh = int(20 * s)
+            by = int(30 * s)
             pygame.draw.arc(self._screen, pupil_color,
-                            (left_eye_x - 18, eye_y - 30, 36, 20),
-                            0, math.pi, 3)
+                            (left_eye_x - bw // 2, eye_y - by, bw, bh),
+                            0, math.pi, line_w)
             pygame.draw.arc(self._screen, pupil_color,
-                            (right_eye_x - 18, eye_y - 30, 36, 20),
-                            0, math.pi, 3)
+                            (right_eye_x - bw // 2, eye_y - by, bw, bh),
+                            0, math.pi, line_w)
         elif emotion == "fear":
             # Fear — wide eyes with small pupils
-            pygame.draw.circle(self._screen, eye_color, (left_eye_x, eye_y), 15)
-            pygame.draw.circle(self._screen, eye_color, (right_eye_x, eye_y), 15)
-            pygame.draw.circle(self._screen, pupil_color, (left_eye_x - 2, eye_y - 2), 4)
-            pygame.draw.circle(self._screen, pupil_color, (right_eye_x + 2, eye_y - 2), 4)
+            big_r = int(15 * s)
+            pr = int(4 * s)
+            off = int(2 * s)
+            pygame.draw.circle(self._screen, eye_color, (left_eye_x, eye_y), big_r)
+            pygame.draw.circle(self._screen, eye_color, (right_eye_x, eye_y), big_r)
+            pygame.draw.circle(self._screen, pupil_color, (left_eye_x - off, eye_y - off), pr)
+            pygame.draw.circle(self._screen, pupil_color, (right_eye_x + off, eye_y - off), pr)
         elif emotion == "disgust":
             # Disgust — squinted eyes
+            ew = int(28 * s)
+            eh = int(10 * s)
+            pr = int(4 * s)
             pygame.draw.ellipse(self._screen, eye_color,
-                                (left_eye_x - 14, eye_y - 4, 28, 10))
+                                (left_eye_x - ew // 2, eye_y - eh // 2, ew, eh))
             pygame.draw.ellipse(self._screen, eye_color,
-                                (right_eye_x - 14, eye_y - 4, 28, 10))
-            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), 4)
-            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), 4)
+                                (right_eye_x - ew // 2, eye_y - eh // 2, ew, eh))
+            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), pr)
+            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), pr)
         else:
             # Neutral — normal round eyes
-            pygame.draw.circle(self._screen, eye_color, (left_eye_x, eye_y), 13)
-            pygame.draw.circle(self._screen, eye_color, (right_eye_x, eye_y), 13)
-            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), 6)
-            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), 6)
+            pygame.draw.circle(self._screen, eye_color, (left_eye_x, eye_y), eye_r)
+            pygame.draw.circle(self._screen, eye_color, (right_eye_x, eye_y), eye_r)
+            pygame.draw.circle(self._screen, pupil_color, (left_eye_x, eye_y), pupil_r)
+            pygame.draw.circle(self._screen, pupil_color, (right_eye_x, eye_y), pupil_r)
 
         # ── Mouth ──
-        mouth_y = cy + 30 + breath
+        mouth_y = int(cy + 30 * s + breath)
 
         if emotion == "happy":
             # Wide smile arc
+            mw = int(60 * s)
+            mh = int(30 * s)
             pygame.draw.arc(self._screen, mouth_color,
-                            (cx - 30, mouth_y - 15 + talk_offset, 60, 30 + abs(talk_offset)),
-                            math.pi, 2 * math.pi, 4)
+                            (cx - mw // 2, mouth_y - mh // 2 + int(talk_offset),
+                             mw, mh + int(abs(talk_offset))),
+                            math.pi, 2 * math.pi, thick_w)
         elif emotion == "sad":
             # Downturned frown
+            mw = int(50 * s)
+            mh = int(20 * s)
             pygame.draw.arc(self._screen, mouth_color,
-                            (cx - 25, mouth_y + talk_offset, 50, 20),
-                            0, math.pi, 4)
+                            (cx - mw // 2, mouth_y + int(talk_offset), mw, mh),
+                            0, math.pi, thick_w)
         elif emotion == "angry":
-            # Tight frown line
+            # Tight frown line with downturned corners
+            hw = int(25 * s)
+            corner = int(8 * s)
             pygame.draw.line(self._screen, mouth_color,
-                             (cx - 25, mouth_y + 2), (cx + 25, mouth_y + 2), 4)
+                             (cx - hw, mouth_y + 2), (cx + hw, mouth_y + 2), thick_w)
             pygame.draw.line(self._screen, mouth_color,
-                             (cx - 25, mouth_y + 2), (cx - 18, mouth_y + 8), 3)
+                             (cx - hw, mouth_y + 2), (cx - hw + int(7 * s), mouth_y + corner), line_w)
             pygame.draw.line(self._screen, mouth_color,
-                             (cx + 25, mouth_y + 2), (cx + 18, mouth_y + 8), 3)
+                             (cx + hw, mouth_y + 2), (cx + hw - int(7 * s), mouth_y + corner), line_w)
         elif emotion == "surprise":
             # O-shaped mouth
-            o_height = int(18 + abs(talk_offset))
+            ow = int(24 * s)
+            oh = int(18 * s) + int(abs(talk_offset))
             pygame.draw.ellipse(self._screen, mouth_color,
-                                (cx - 12, mouth_y - 8, 24, o_height), 0)
+                                (cx - ow // 2, mouth_y - oh // 2, ow, oh), 0)
         elif emotion == "fear":
             # Wavy worried mouth
             points = []
+            mw = int(20 * s)
             for i in range(20):
-                px = cx - 20 + i * 2
-                py = mouth_y + math.sin(i * 0.8 + self._talk_phase) * 4
-                points.append((px, py))
+                px = cx - mw + i * int(2 * s)
+                py = mouth_y + math.sin(i * 0.8 + self._talk_phase) * (4 * s)
+                points.append((int(px), int(py)))
             if len(points) > 1:
-                pygame.draw.lines(self._screen, mouth_color, False, points, 3)
+                pygame.draw.lines(self._screen, mouth_color, False, points, line_w)
         elif emotion == "disgust":
             # Tongue out
+            hw = int(20 * s)
             pygame.draw.line(self._screen, mouth_color,
-                             (cx - 20, mouth_y), (cx + 20, mouth_y), 3)
+                             (cx - hw, mouth_y), (cx + hw, mouth_y), line_w)
+            tw = int(8 * s)
+            th = int(12 * s)
             pygame.draw.ellipse(self._screen, (200, 100, 100),
-                                (cx - 8, mouth_y, 16, 12))
+                                (cx - tw, mouth_y, tw * 2, th))
         else:
             # Neutral — small line or gentle curve
+            hw = int(20 * s)
             if is_talking:
-                h = int(8 + abs(talk_offset))
+                h = int(8 * s + abs(talk_offset))
                 pygame.draw.ellipse(self._screen, mouth_color,
-                                    (cx - 15, mouth_y - 4, 30, h), 0)
+                                    (cx - int(15 * s), mouth_y - int(4 * s),
+                                     int(30 * s), h), 0)
             else:
                 pygame.draw.line(self._screen, mouth_color,
-                                 (cx - 20, mouth_y), (cx + 20, mouth_y), 3)
+                                 (cx - hw, mouth_y), (cx + hw, mouth_y), line_w)
 
         # ── Blush for happy/surprise ──
         if emotion in ("happy", "surprise"):
             blush_alpha = 80
-            blush_surface = pygame.Surface((30, 16), pygame.SRCALPHA)
+            bw = int(30 * s)
+            bh = int(16 * s)
+            blush_surface = pygame.Surface((bw, bh), pygame.SRCALPHA)
             pygame.draw.ellipse(blush_surface, (255, 150, 150, blush_alpha),
-                                (0, 0, 30, 16))
-            self._screen.blit(blush_surface, (left_eye_x - 15, eye_y + 18))
-            self._screen.blit(blush_surface, (right_eye_x - 15, eye_y + 18))
+                                (0, 0, bw, bh))
+            self._screen.blit(blush_surface, (left_eye_x - bw // 2, eye_y + int(18 * s)))
+            self._screen.blit(blush_surface, (right_eye_x - bw // 2, eye_y + int(18 * s)))
 
         pygame.display.flip()
 

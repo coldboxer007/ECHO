@@ -89,12 +89,20 @@ TTS_SAMPLE_RATE = 24000  # Gemini TTS outputs 24kHz
 TTS_FALLBACK_ENGINE = "espeak"  # Fallback if Gemini TTS fails
 
 # ─────────────────────────────────────────────
-# Face Display
+# Audio Output (3.5mm headphone jack + small speaker)
 # ─────────────────────────────────────────────
-DISPLAY_WIDTH = 320   # Adjust to your display resolution
-DISPLAY_HEIGHT = 240
+# Force audio through 3.5mm jack (not HDMI)
+# Set on Pi with: sudo raspi-config → System Options → Audio → Headphones
+# Or: amixer cset numid=3 1
+AUDIO_OUTPUT = "headphones"  # "headphones" = 3.5mm jack, "hdmi" = HDMI audio
+
+# ─────────────────────────────────────────────
+# Face Display (5" HDMI capacitive touch, 800x480)
+# ─────────────────────────────────────────────
+DISPLAY_WIDTH = 800   # 5-inch HDMI display native width
+DISPLAY_HEIGHT = 480  # 5-inch HDMI display native height
 DISPLAY_FPS = 30
-DISPLAY_FULLSCREEN = False  # Set True for kiosk mode on the robot
+DISPLAY_FULLSCREEN = True  # Fullscreen for robot kiosk mode
 
 # Emotion → face color mapping
 EMOTION_COLORS = {
