@@ -32,6 +32,7 @@ class MotorController:
     def __init__(self):
         self.running = False
         self._setup_gpio()
+        self.stop()  # Ensure all motors are stopped on startup
         logger.info("MotorController initialized")
 
     def _setup_gpio(self):
@@ -43,9 +44,10 @@ class MotorController:
         GPIO.setmode(GPIO.BOARD)
         GPIO.setwarnings(False)
 
+        # Use initial=GPIO.LOW so each pin is driven LOW the instant it
+        # becomes an output — no floating gap that could spin the motors.
         for pin in [MOTOR_IN1, MOTOR_IN2, MOTOR_IN3, MOTOR_IN4]:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, GPIO.LOW)
+            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
 
         logger.info(
             f"Motor pins configured: IN1={MOTOR_IN1}, IN2={MOTOR_IN2}, "
@@ -69,8 +71,8 @@ class MotorController:
         """Drive both sides forward."""
         logger.info(f"Moving FORWARD{f' for {duration}s' if duration else ''}")
         self.running = True
-        # Left forward (IN1=HIGH, IN2=LOW), Right forward (IN3=HIGH, IN4=LOW)
-        self._set_motors(True, False, True, False)
+        # Wiring is swapped: IN2=LEFT FWD, IN4=RIGHT FWD
+        self._set_motors(False, True, False, True)
         if duration:
             time.sleep(duration)
             self.stop()
@@ -79,8 +81,8 @@ class MotorController:
         """Drive both sides backward."""
         logger.info(f"Moving BACKWARD{f' for {duration}s' if duration else ''}")
         self.running = True
-        # Left backward (IN1=LOW, IN2=HIGH), Right backward (IN3=LOW, IN4=HIGH)
-        self._set_motors(False, True, False, True)
+        # Wiring is swapped: IN1=LEFT BWD, IN3=RIGHT BWD
+        self._set_motors(True, False, True, False)
         if duration:
             time.sleep(duration)
             self.stop()
@@ -90,8 +92,8 @@ class MotorController:
         duration = duration or MOTOR_TURN_DURATION
         logger.info(f"Turning LEFT for {duration}s")
         self.running = True
-        # Left backward, Right forward
-        self._set_motors(False, True, True, False)
+        # Wiring swapped: IN1=LEFT BWD, IN4=RIGHT FWD
+        self._set_motors(True, False, False, True)
         if duration:
             time.sleep(duration)
             self.stop()
@@ -101,8 +103,8 @@ class MotorController:
         duration = duration or MOTOR_TURN_DURATION
         logger.info(f"Turning RIGHT for {duration}s")
         self.running = True
-        # Left forward, Right backward
-        self._set_motors(True, False, False, True)
+        # Wiring swapped: IN2=LEFT FWD, IN3=RIGHT BWD
+        self._set_motors(False, True, True, False)
         if duration:
             time.sleep(duration)
             self.stop()
@@ -114,18 +116,23 @@ class MotorController:
         self._set_motors(False, False, False, False)
 
     def slight_left(self):
-        """Gentle left correction for follow mode — left side slow, right forward."""
-        self._set_motors(False, False, True, False)
+        """Gentle left correction for follow mode — right forward only."""
+        self._set_motors(False, False, False, True)
 
     def slight_right(self):
-        """Gentle right correction for follow mode — left forward, right slow."""
-        self._set_motors(True, False, False, False)
+        """Gentle right correction for follow mode — left forward only."""
+        self._set_motors(False, True, False, False)
 
     # ── Cleanup ──
 
     def cleanup(self):
-        """Release GPIO resources."""
+        """Stop motors and leave pins as LOW outputs.
+
+        We intentionally do NOT call GPIO.cleanup() because that resets
+        the pins to INPUT (high-impedance / floating), which the L298N
+        reads as HIGH and spins the motors.  Leaving them as LOW outputs
+        keeps the motors safely off even after the program exits.
+        """
         self.stop()
-        if RPI_AVAILABLE:
-            GPIO.cleanup()
-        logger.info("MotorController cleaned up")
+        # GPIO.cleanup() is deliberately omitted.
+        logger.info("MotorController cleaned up (pins left LOW)")

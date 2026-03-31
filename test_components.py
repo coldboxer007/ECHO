@@ -33,6 +33,7 @@ Usage:
 import sys
 import time
 import logging
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,51 +42,122 @@ logging.basicConfig(
 logger = logging.getLogger("echo.test")
 
 
+# ═══════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════
+
+def timestamp():
+    """Return current time as a formatted string."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def banner(title: str, icon: str = "🔧"):
+    """Print a clear test section banner with timestamp."""
+    ts = timestamp()
+    width = 55
+    print()
+    print("═" * width)
+    print(f"  {icon}  {title}")
+    print(f"  Started: {ts}")
+    print("═" * width)
+
+
+def step(msg: str):
+    """Print a timestamped test step."""
+    print(f"  [{timestamp()}]  {msg}")
+
+
+def result(passed: bool, msg: str = ""):
+    """Print a pass/fail result."""
+    icon = "✅ PASS" if passed else "❌ FAIL"
+    suffix = f" — {msg}" if msg else ""
+    print(f"  [{timestamp()}]  {icon}{suffix}")
+    return passed
+
+
+# ═══════════════════════════════════════════════════
+# Individual Tests
+# ═══════════════════════════════════════════════════
+
 def test_motors():
-    """Test each motor direction for 1 second."""
+    """Test each motor direction for 2 seconds each."""
     from motor_controller import MotorController
 
-    print("\n🔧 Testing Motors...")
+    banner("Motor Test (L298N — 6 motors, 2 sides)", "⚙️")
     m = MotorController()
+    passed = True
 
-    print("  ➡️  Forward (2s)...")
-    m.forward(2.0)
-    time.sleep(0.5)
+    try:
+        step("Ensuring all motors stopped first...")
+        m.stop()
+        time.sleep(0.5)
 
-    print("  ⬅️  Backward (2s)...")
-    m.backward(2.0)
-    time.sleep(0.5)
+        step("Forward (2s) — both sides drive forward...")
+        m.forward(2.0)
+        time.sleep(0.5)
 
-    print("  ↩️  Turn Left (1s)...")
-    m.turn_left(1.0)
-    time.sleep(0.5)
+        step("Backward (2s) — both sides drive backward...")
+        m.backward(2.0)
+        time.sleep(0.5)
 
-    print("  ↪️  Turn Right (1s)...")
-    m.turn_right(1.0)
-    time.sleep(0.5)
+        step("Turn Left (1s) — left back, right forward...")
+        m.turn_left(1.0)
+        time.sleep(0.5)
 
-    print("  🛑 Stop")
-    m.stop()
+        step("Turn Right (1s) — left forward, right back...")
+        m.turn_right(1.0)
+        time.sleep(0.5)
+
+        step("Stop — all motors off")
+        m.stop()
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
+
     m.cleanup()
-    print("  ✅ Motor test complete!\n")
+    return result(passed, "Motor test complete")
 
 
 def test_sensors():
     """Continuously read sensors for 10 seconds."""
     from sensor_controller import SensorController
 
-    print("\n📡 Testing Sensors (10 seconds)...")
+    banner("Sensor Test (HC-SR04 Ultrasonic + IR)", "📡")
     s = SensorController()
+    passed = True
+    obstacle_seen = False
 
-    for i in range(50):
-        dist = s.read_distance()
-        ir = s.read_ir()
-        obstacle = s.is_obstacle_ahead()
-        print(f"  [{i:3d}] Distance: {dist:6.1f}cm | IR: {'BLOCKED' if ir else 'clear'} | Obstacle: {'YES' if obstacle else 'no'}")
-        time.sleep(0.2)
+    try:
+        step("Reading sensors for 10 seconds (50 samples)...")
+        print(f"  {'─' * 50}")
+
+        for i in range(50):
+            dist = s.read_distance()
+            ir = s.read_ir()
+            obstacle = s.is_obstacle_ahead()
+
+            if obstacle:
+                obstacle_seen = True
+
+            ir_str = "BLOCKED" if ir else "clear  "
+            obs_str = "⚠ YES" if obstacle else "  no "
+            bar = "█" * min(40, int(dist / 5))
+            print(
+                f"  [{i+1:3d}/50] Dist: {dist:6.1f}cm  IR: {ir_str}  Obstacle: {obs_str}  {bar}",
+                end="\r" if i < 49 else "\n"
+            )
+            time.sleep(0.2)
+
+        print(f"  {'─' * 50}")
+        step(f"Obstacle detected at any point: {'Yes' if obstacle_seen else 'No'}")
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     s.cleanup()
-    print("  ✅ Sensor test complete!\n")
+    return result(passed, "Sensor test complete")
 
 
 def test_camera():
@@ -93,46 +165,72 @@ def test_camera():
     from camera_sentiment import CameraSentiment
     import cv2
 
-    print("\n📷 Testing Camera...")
+    banner("Camera Test (USB Webcam + Face Detection)", "📷")
     cam = CameraSentiment()
+    passed = True
 
-    frame = cam.capture_frame()
-    if frame is not None:
-        print(f"  Frame captured: {frame.shape}")
-        faces = cam.detect_faces(frame)
-        print(f"  Faces detected: {len(faces)}")
-        for i, (x, y, w, h) in enumerate(faces):
-            print(f"    Face {i}: x={x}, y={y}, w={w}, h={h}")
+    try:
+        step("Capturing frame from USB camera...")
+        frame = cam.capture_frame()
 
-        # Save test frame
-        cv2.imwrite("/tmp/echo_test_frame.jpg", frame)
-        print("  Frame saved to /tmp/echo_test_frame.jpg")
-    else:
-        print("  ❌ Failed to capture frame!")
+        if frame is not None:
+            step(f"Frame captured: {frame.shape[1]}x{frame.shape[0]} ({frame.shape[2]}ch)")
+            step("Running face detection (Haar cascade)...")
+            faces = cam.detect_faces(frame)
+            step(f"Faces detected: {len(faces)}")
+
+            for i, (x, y, w, h) in enumerate(faces):
+                step(f"  Face {i}: pos=({x},{y}) size={w}x{h}")
+
+            # Save test frame
+            path = "/tmp/echo_test_frame.jpg"
+            cv2.imwrite(path, frame)
+            step(f"Test frame saved to {path}")
+        else:
+            passed = False
+            step("Failed to capture frame!")
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     cam.cleanup()
-    print("  ✅ Camera test complete!\n")
+    return result(passed, "Camera test complete")
 
 
 def test_sentiment():
-    """Test TFLite sentiment analysis."""
+    """Test TFLite sentiment analysis on live frames."""
     from camera_sentiment import CameraSentiment
 
-    print("\n😊 Testing Sentiment Analysis...")
+    banner("Sentiment Analysis (TFLite FER Model)", "😊")
     cam = CameraSentiment()
+    passed = True
+    detected_emotions = []
 
-    for i in range(5):
-        emotion, conf = cam.analyze_sentiment()
-        print(f"  [{i}] Emotion: {emotion} (confidence: {conf:.2f})")
-        time.sleep(1)
+    try:
+        step("Running 5 sentiment analysis cycles (1s apart)...")
+        for i in range(5):
+            emotion, conf = cam.analyze_sentiment()
+            detected_emotions.append(emotion)
+            conf_bar = "█" * int(conf * 20)
+            step(f"  [{i+1}/5] Emotion: {emotion:10s} Confidence: {conf:.2f} {conf_bar}")
+            time.sleep(1)
+
+        unique = set(detected_emotions)
+        step(f"Unique emotions detected: {unique}")
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     cam.cleanup()
-    print("  ✅ Sentiment test complete!\n")
+    return result(passed, "Sentiment test complete")
 
 
 def test_mic():
-    """Test microphone recording."""
-    print("\n🎤 Testing Microphone (speak for up to 5 seconds)...")
+    """Test microphone recording and RMS levels."""
+    banner("Microphone Test (USB Mic)", "🎤")
+    passed = True
 
     try:
         import pyaudio
@@ -140,29 +238,55 @@ def test_mic():
 
         pa = pyaudio.PyAudio()
 
-        # List audio devices
-        print("  Available audio devices:")
+        step("Scanning audio input devices...")
+        input_count = 0
         for i in range(pa.get_device_count()):
             info = pa.get_device_info_by_index(i)
             if info['maxInputChannels'] > 0:
-                print(f"    [{i}] {info['name']} (inputs: {info['maxInputChannels']})")
+                input_count += 1
+                step(f"  [{i}] {info['name']} (inputs: {info['maxInputChannels']})")
 
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=16000,
-            input=True,
-            frames_per_buffer=1024,
-        )
+        step(f"Total input devices found: {input_count}")
 
-        print("  Recording... speak now!")
+        # Find a working sample rate
+        stream = None
+        selected_rate = None
+        candidate_rates = []
+
+        try:
+            default_in = pa.get_default_input_device_info()
+            default_rate = int(default_in.get('defaultSampleRate', 16000))
+            if default_rate > 0:
+                candidate_rates.append(default_rate)
+        except Exception:
+            pass
+
+        for rate in [16000, 48000, 44100, 32000]:
+            if rate not in candidate_rates:
+                candidate_rates.append(rate)
+
+        for rate in candidate_rates:
+            try:
+                stream = pa.open(
+                    format=pyaudio.paInt16, channels=1, rate=rate,
+                    input=True, frames_per_buffer=1024,
+                )
+                selected_rate = rate
+                break
+            except Exception:
+                continue
+
+        if stream is None:
+            raise RuntimeError("Could not open microphone at any supported sample rate")
+
+        step(f"Recording at {selected_rate} Hz — speak now! (5 seconds)")
         max_rms = 0
-        for _ in range(80):  # ~5 seconds
+        for _ in range(int(5 * selected_rate / 1024)):
             data = stream.read(1024, exception_on_overflow=False)
             samples = struct.unpack('1024h', data)
             rms = (sum(s * s for s in samples) / 1024) ** 0.5
             max_rms = max(max_rms, rms)
-            bar = "█" * int(rms / 200)
+            bar = "█" * min(40, int(rms / 150))
             print(f"  RMS: {rms:6.0f} {bar}", end="\r")
             if rms > 500:
                 print()
@@ -171,42 +295,55 @@ def test_mic():
         stream.close()
         pa.terminate()
 
-        print(f"\n  Max RMS: {max_rms:.0f}")
+        print()
+        step(f"Peak RMS: {max_rms:.0f}")
+
         if max_rms > 500:
-            print("  ✅ Microphone is working!")
+            step("Microphone is working — audio detected")
         else:
-            print("  ⚠️  Very quiet — check microphone connection")
+            step("Very quiet — check mic connection")
+            passed = False
 
     except Exception as e:
-        print(f"  ❌ Microphone error: {e}")
-    print()
+        passed = False
+        step(f"Error: {e}")
+
+    return result(passed, "Microphone test complete")
 
 
 def test_stt():
-    """Test speech-to-text."""
+    """Test speech-to-text (Faster Whisper)."""
     from speech_engine import SpeechEngine
 
-    print("\n📝 Testing Speech-to-Text...")
+    banner("Speech-to-Text (Faster Whisper)", "📝")
     speech = SpeechEngine()
+    passed = True
 
-    print("  Speak a sentence...")
-    text = speech.listen()
+    try:
+        step("Say something (up to 5 seconds, will stop on silence)...")
+        text = speech.listen()
 
-    if text:
-        print(f"  ✅ Transcribed: '{text}'")
-    else:
-        print("  ❌ No text transcribed")
+        if text:
+            step(f"Transcribed: '{text}'")
+        else:
+            step("No text transcribed — try speaking louder")
+            passed = False
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     speech.cleanup()
-    print()
+    return result(passed, "STT test complete")
 
 
 def test_tts():
-    """Test text-to-speech."""
+    """Test text-to-speech (Gemini TTS + fallback)."""
     from speech_engine import SpeechEngine
 
-    print("\n🔊 Testing Text-to-Speech...")
+    banner("Text-to-Speech (Gemini TTS → espeak fallback)", "🔊")
     speech = SpeechEngine()
+    passed = True
 
     test_phrases = [
         ("Hello! I am ECHO, your companion robot.", "happy"),
@@ -214,159 +351,205 @@ def test_tts():
         ("Wow, that's really interesting!", "surprise"),
     ]
 
-    for text, emotion in test_phrases:
-        print(f"  Speaking ({emotion}): '{text[:50]}...'")
-        speech.speak(text, emotion=emotion)
-        time.sleep(1)
+    try:
+        for i, (text, emotion) in enumerate(test_phrases, 1):
+            step(f"[{i}/{len(test_phrases)}] Speaking ({emotion}): '{text[:50]}...'")
+            speech.speak(text, emotion=emotion)
+            time.sleep(0.5)
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     speech.cleanup()
-    print("  ✅ TTS test complete!\n")
+    return result(passed, "TTS test complete")
 
 
 def test_gemini():
-    """Test Gemini API connection."""
+    """Test Gemini API connection and command parsing."""
     from gemini_brain import GeminiBrain
 
-    print("\n🧠 Testing Gemini API...")
+    banner("Gemini AI Brain (API + Command Parsing)", "🧠")
     brain = GeminiBrain()
+    passed = True
 
-    test_inputs = [
-        ("Hello, how are you?", "happy", 0.8),
-        ("I'm feeling a bit sad today.", "sad", 0.7),
-        ("What can you do?", "neutral", 0.5),
-    ]
+    try:
+        # Test conversation
+        test_inputs = [
+            ("Hello, how are you?", "happy", 0.8),
+            ("I'm feeling a bit sad today.", "sad", 0.7),
+            ("What can you do?", "neutral", 0.5),
+        ]
 
-    for text, emotion, conf in test_inputs:
-        print(f"\n  Input: '{text}' (emotion={emotion})")
-        response = brain.think(text, emotion, conf)
-        print(f"  Response: '{response}'")
+        step("Testing Gemini conversation...")
+        for text, emotion, conf in test_inputs:
+            step(f"  Input: '{text}' (emotion={emotion})")
+            response = brain.think(text, emotion, conf)
+            if response:
+                step(f"  Reply: '{response[:80]}...'")
+            else:
+                step("  No response — check API key")
+                passed = False
 
-    # Test command parsing
-    print("\n  Testing command parsing:")
-    commands = ["move forward", "turn left", "follow me", "stop", "what's the weather?"]
-    for cmd in commands:
-        result = brain.interpret_command(cmd)
-        print(f"    '{cmd}' → {result['type']}" +
-              (f" ({result.get('direction', '')})" if result['type'] == 'move' else ""))
+        # Test command parsing
+        step("Testing command parsing...")
+        commands = [
+            ("move forward", "move/forward"),
+            ("turn left", "move/left"),
+            ("follow me", "follow"),
+            ("stop", "stop"),
+            ("what's the weather?", "chat"),
+        ]
+        for cmd, expected in commands:
+            r = brain.interpret_command(cmd)
+            actual = r['type'] + (f"/{r.get('direction', '')}" if r['type'] == 'move' else '')
+            match = "✓" if actual == expected else "✗"
+            step(f"  '{cmd}' → {actual} {match}")
+
+        # Test emotion fallback
+        step("Testing response emotion analysis...")
+        test_responses = [
+            ("I'm so happy to help you!", "neutral"),
+            ("I'm sorry to hear that.", "neutral"),
+            ("Wow, that's amazing!", "neutral"),
+        ]
+        for resp, user_em in test_responses:
+            em = brain.determine_response_emotion(resp, user_em)
+            step(f"  '{resp[:40]}...' → {em}")
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     brain.cleanup()
-    print("\n  ✅ Gemini test complete!\n")
+    return result(passed, "Gemini test complete")
 
 
 def test_face():
     """Test face display with all emotions sequentially."""
     from face_display import FaceDisplay
 
-    print("\n😄 Testing Face Display — All Emotions...")
+    banner("Face Display — All Emotions", "😄")
     face = FaceDisplay()
     face.start()
+    passed = True
 
     emotions = ["neutral", "happy", "sad", "angry", "surprise", "fear", "disgust"]
 
-    for emotion in emotions:
-        print(f"  Showing: {emotion}")
-        face.set_emotion(emotion)
-        time.sleep(2.5)
+    try:
+        for i, emotion in enumerate(emotions, 1):
+            step(f"[{i}/{len(emotions)}] Showing: {emotion} (2.5s)")
+            face.set_emotion(emotion)
+            time.sleep(2.5)
 
-    # Test talking animation
-    print("  Testing talking animation (happy)...")
-    face.set_emotion("happy")
-    face.set_talking(True)
-    time.sleep(3)
-    face.set_talking(False)
+        # Test talking
+        step("Testing talking animation (happy, 3s)...")
+        face.set_emotion("happy")
+        face.set_talking(True)
+        time.sleep(3)
+        face.set_talking(False)
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     face.cleanup()
-    print("  ✅ Face display test complete!\n")
+    return result(passed, "Face display test complete")
 
 
 def _test_face_single(emotion: str, duration: float = 5.0):
     """Helper: show a single emotion on the face display."""
     from face_display import FaceDisplay
 
-    print(f"\n😄 Testing Face Display — {emotion.upper()}...")
+    banner(f"Face Display — {emotion.upper()}", "😄")
     face = FaceDisplay()
     face.start()
 
+    step(f"Showing '{emotion}' for {duration}s (Ctrl+C to exit early)...")
     face.set_emotion(emotion)
-    print(f"  Showing '{emotion}' for {duration}s...")
-    print(f"  (Press Ctrl+C to exit early)")
     try:
         time.sleep(duration)
     except KeyboardInterrupt:
-        pass
+        step("Interrupted by user")
 
     face.cleanup()
-    print(f"  ✅ {emotion} face test complete!\n")
+    return result(True, f"{emotion} face test complete")
 
 
 def test_face_neutral():
-    _test_face_single("neutral")
+    return _test_face_single("neutral")
 
 def test_face_happy():
-    _test_face_single("happy")
+    return _test_face_single("happy")
 
 def test_face_sad():
-    _test_face_single("sad")
+    return _test_face_single("sad")
 
 def test_face_angry():
-    _test_face_single("angry")
+    return _test_face_single("angry")
 
 def test_face_surprise():
-    _test_face_single("surprise")
+    return _test_face_single("surprise")
 
 def test_face_fear():
-    _test_face_single("fear")
+    return _test_face_single("fear")
 
 def test_face_disgust():
-    _test_face_single("disgust")
+    return _test_face_single("disgust")
 
 
 def test_face_talk():
     """Test talking animation cycling through emotions."""
     from face_display import FaceDisplay
 
-    print("\n🗣️  Testing Face Display — Talking Animation...")
+    banner("Face Display — Talking Animation", "🗣️")
     face = FaceDisplay()
     face.start()
+    passed = True
 
     emotions = ["neutral", "happy", "sad", "surprise"]
-    for emotion in emotions:
-        print(f"  Talking with '{emotion}' face (3s)...")
-        face.set_emotion(emotion)
-        face.set_talking(True)
-        time.sleep(3)
-        face.set_talking(False)
-        time.sleep(0.5)
+
+    try:
+        for i, emotion in enumerate(emotions, 1):
+            step(f"[{i}/{len(emotions)}] Talking with '{emotion}' face (3s)...")
+            face.set_emotion(emotion)
+            face.set_talking(True)
+            time.sleep(3)
+            face.set_talking(False)
+            time.sleep(0.5)
+
+    except Exception as e:
+        passed = False
+        step(f"Error: {e}")
 
     face.cleanup()
-    print("  ✅ Talking animation test complete!\n")
+    return result(passed, "Talking animation test complete")
 
 
 def test_face_blink():
-    """Test blinking — watch the neutral face for ~15 seconds, blinks happen every ~3.5s."""
+    """Test blinking — watch the neutral face for ~15 seconds."""
     from face_display import FaceDisplay
 
-    print("\n👁️  Testing Face Display — Blinking...")
-    print("  Watch for automatic blinks (every ~3.5 seconds)")
+    banner("Face Display — Blinking", "👁️")
     face = FaceDisplay()
     face.start()
 
+    step("Showing neutral face for 15s — blinks happen every ~3.5 seconds")
     face.set_emotion("neutral")
-    print("  Displaying neutral face for 15s — watch for blinks...")
     try:
         time.sleep(15)
     except KeyboardInterrupt:
-        pass
+        step("Interrupted by user")
 
     face.cleanup()
-    print("  ✅ Blink test complete!\n")
+    return result(True, "Blink test complete")
 
 
 def test_face_cycle():
-    """Continuously cycle through all emotions (good for demos)."""
+    """Continuously cycle through all emotions."""
     from face_display import FaceDisplay
 
-    print("\n🔄 Testing Face Display — Emotion Cycle (Ctrl+C to stop)...")
+    banner("Face Display — Emotion Cycle (Ctrl+C to stop)", "🔄")
     face = FaceDisplay()
     face.start()
 
@@ -375,20 +558,21 @@ def test_face_cycle():
         cycle = 0
         while True:
             for emotion in emotions:
-                print(f"  [Cycle {cycle}] {emotion}")
+                step(f"[Cycle {cycle}] {emotion}")
                 face.set_emotion(emotion)
                 time.sleep(2)
             cycle += 1
     except KeyboardInterrupt:
-        print("\n  Stopped by user.")
+        step("Stopped by user")
 
     face.cleanup()
-    print("  ✅ Cycle test complete!\n")
+    return result(True, "Cycle test complete")
 
 
 def test_display():
     """Test that the 5-inch HDMI display initializes correctly."""
-    print("\n🖥️  Testing 5\" HDMI Display...")
+    banner("5\" HDMI Display Init", "🖥️")
+    passed = True
 
     try:
         import pygame
@@ -396,83 +580,85 @@ def test_display():
 
         pygame.init()
         info = pygame.display.Info()
-        print(f"  Detected display: {info.current_w}x{info.current_h}")
-        print(f"  Configured size:  {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
+        step(f"Detected display: {info.current_w}x{info.current_h}")
+        step(f"Configured size:  {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
 
         screen = pygame.display.set_mode((DISPLAY_WIDTH, DISPLAY_HEIGHT))
         pygame.display.set_caption("ECHO Display Test")
 
-        # Draw test pattern — red, green, blue, white quadrants
+        # Draw test pattern
         hw = DISPLAY_WIDTH // 2
         hh = DISPLAY_HEIGHT // 2
         screen.fill((0, 0, 0))
-        pygame.draw.rect(screen, (255, 0, 0), (0, 0, hw, hh))       # Top-left red
-        pygame.draw.rect(screen, (0, 255, 0), (hw, 0, hw, hh))      # Top-right green
-        pygame.draw.rect(screen, (0, 0, 255), (0, hh, hw, hh))      # Bottom-left blue
-        pygame.draw.rect(screen, (255, 255, 255), (hw, hh, hw, hh))  # Bottom-right white
+        pygame.draw.rect(screen, (255, 0, 0), (0, 0, hw, hh))
+        pygame.draw.rect(screen, (0, 255, 0), (hw, 0, hw, hh))
+        pygame.draw.rect(screen, (0, 0, 255), (0, hh, hw, hh))
+        pygame.draw.rect(screen, (255, 255, 255), (hw, hh, hw, hh))
 
-        # Draw center text
         font = pygame.font.Font(None, 48)
         text = font.render(f"ECHO {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}", True, (0, 0, 0))
         text_rect = text.get_rect(center=(DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2))
         screen.blit(text, text_rect)
 
         pygame.display.flip()
-        print("  Test pattern displayed (R/G/B/W quadrants)")
-        print("  Waiting 5 seconds...")
+        step("Test pattern displayed (R/G/B/W quadrants)")
+        step("Waiting 5 seconds...")
         time.sleep(5)
 
         pygame.quit()
-        print("  ✅ Display test complete!\n")
 
     except Exception as e:
-        print(f"  ❌ Display test failed: {e}\n")
+        passed = False
+        step(f"Error: {e}")
+
+    return result(passed, "Display test complete")
 
 
 def test_audio_out():
     """Test speaker output through 3.5mm jack."""
-    print("\n🔊 Testing Audio Output (3.5mm Jack Speaker)...")
+    banner("Audio Output (3.5mm Jack Speaker)", "🔊")
+    passed = True
 
     try:
         import subprocess
 
-        # Check current audio output setting
-        print("  Checking audio output routing...")
-        result = subprocess.run(
+        step("Checking audio output routing...")
+        r = subprocess.run(
             ["amixer", "cget", "numid=3"],
             capture_output=True, text=True, timeout=5
         )
-        if result.returncode == 0:
-            print(f"  Audio config: {result.stdout.strip()[:100]}...")
+        if r.returncode == 0:
+            step(f"Audio config: {r.stdout.strip()[:100]}...")
         else:
-            print("  Could not read amixer config (may be fine on some setups)")
+            step("Could not read amixer config (may be fine on some setups)")
 
-        # Generate a test tone using espeak
-        print("  Playing test speech through speaker...")
+        step("Playing test speech through speaker (espeak)...")
         subprocess.run(
             ["espeak", "-s", "150", "-v", "en",
              "Hello! This is Echo testing the speaker output. One two three."],
             timeout=15
         )
-        print("  Did you hear the test speech?")
+        step("Test speech played — did you hear it?")
 
-        # Try a beep test too
-        print("  Playing test tone (speaker-test)...")
+        step("Playing 440Hz test tone (2 seconds)...")
         subprocess.run(
             ["speaker-test", "-t", "sine", "-f", "440", "-l", "1", "-p", "2"],
             capture_output=True, timeout=10
         )
-        print("  ✅ Audio output test complete!\n")
 
     except FileNotFoundError as e:
-        print(f"  ⚠️  Tool not found: {e}")
-        print("  On Pi, run: sudo apt install espeak alsa-utils")
+        step(f"Tool not found: {e}")
+        step("On Pi, run: sudo apt install espeak alsa-utils")
+        passed = False
     except Exception as e:
-        print(f"  ❌ Audio test error: {e}\n")
+        passed = False
+        step(f"Error: {e}")
+
+    return result(passed, "Audio output test complete")
 
 
 # ═══════════════════════════════════════════════════
-# Main
+# Test Registry
 # ═══════════════════════════════════════════════════
 
 TESTS = {
@@ -499,7 +685,7 @@ TESTS = {
     'audio-out':     test_audio_out,
 }
 
-# Tests to run when "all" is specified (excludes interactive/looping ones)
+# Ordered list for "all" (excludes interactive/looping ones)
 ALL_TESTS = [
     'display', 'audio-out', 'motors', 'sensors', 'camera', 'sentiment',
     'mic', 'stt', 'tts', 'gemini', 'face',
@@ -518,14 +704,48 @@ def main():
     target = sys.argv[1].lower()
 
     if target == 'all':
-        for name in ALL_TESTS:
-            print(f"\n{'='*50}")
-            print(f"  Running: {name}")
-            print(f"{'='*50}")
+        # Run all tests with progress and summary
+        total = len(ALL_TESTS)
+        results = {}
+
+        print()
+        print("╔" + "═" * 55 + "╗")
+        print("║  🤖 ECHO Robot — Full Test Suite                      ║")
+        print(f"║  Started: {timestamp()}                               ║")
+        print(f"║  Tests:   {total}                                         ║")
+        print("╚" + "═" * 55 + "╝")
+
+        for i, name in enumerate(ALL_TESTS, 1):
+            print(f"\n  ▶ Test {i}/{total}: {name}")
             try:
-                TESTS[name]()
+                passed = TESTS[name]()
+                results[name] = passed
             except Exception as e:
-                print(f"  ❌ {name} failed: {e}")
+                print(f"  ❌ {name} CRASHED: {e}")
+                results[name] = False
+
+        # Print summary
+        print()
+        print("╔" + "═" * 55 + "╗")
+        print("║  📊 TEST SUMMARY                                      ║")
+        print("╠" + "═" * 55 + "╣")
+
+        pass_count = 0
+        for name in ALL_TESTS:
+            passed = results.get(name, False)
+            if passed:
+                pass_count += 1
+            icon = "✅" if passed else "❌"
+            print(f"║  {icon}  {name:20s}                              ║")
+
+        print("╠" + "═" * 55 + "╣")
+        ratio = f"{pass_count}/{total}"
+        pct = int(pass_count / total * 100) if total > 0 else 0
+        status = "ALL PASSED! 🎉" if pass_count == total else f"{ratio} passed ({pct}%)"
+        print(f"║  Result: {status:44s} ║")
+        print(f"║  Finished: {timestamp()}                             ║")
+        print("╚" + "═" * 55 + "╝")
+
     elif target in TESTS:
         TESTS[target]()
     else:

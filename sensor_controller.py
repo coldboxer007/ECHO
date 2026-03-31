@@ -124,10 +124,14 @@ class SensorController:
             self._distance = distance
             self._ir_blocked = ir_blocked
 
+        # Readings below 2cm are likely sensor noise — ignore them
+        if distance < 2.0:
+            distance = 999.0
+
         obstacle = distance < OBSTACLE_DISTANCE_CM or ir_blocked
 
         if obstacle:
-            logger.warning(
+            logger.debug(
                 f"Obstacle detected! Distance: {distance}cm, IR: {ir_blocked}"
             )
 

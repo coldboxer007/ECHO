@@ -80,6 +80,8 @@ class ECHO:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
+        # Safety: ensure all motors are stopped before starting
+        self.motors.stop()
         logger.info("✅ All subsystems initialized!")
 
     def start(self):
@@ -137,6 +139,7 @@ class ECHO:
                 logger.info(f"👤 User said: '{user_text}'")
 
                 # ── Step 2: Get current emotion from camera ──
+                # Use local TFLite model only (skip Gemini API fallback to save ~4s latency)
                 emotion = self.camera.current_emotion
                 confidence = self.camera.current_confidence
                 logger.info(f"😊 Detected emotion: {emotion} ({confidence:.0%})")
@@ -147,6 +150,15 @@ class ECHO:
 
                 if command['type'] == 'move':
                     self._handle_move(command)
+
+                elif command['type'] == 'keep_moving':
+                    self._handle_keep_moving(command)
+
+                elif command['type'] == 'safe_move':
+                    self._handle_safe_move(command)
+
+                elif command['type'] == 'patrol':
+                    self._handle_patrol()
 
                 elif command['type'] == 'follow':
                     self._handle_follow()
@@ -168,33 +180,51 @@ class ECHO:
     def _handle_move(self, command: dict):
         """Handle movement voice commands."""
         direction = command['direction']
+        duration = command.get('duration', None)
+        logger.info(f"🚗 Executing move: {direction}{f' for {duration}s' if duration else ''}")
 
         # Update face
         self.face.set_emotion("neutral")
 
-        # Acknowledge
-        ack_messages = {
-            'forward':  "Moving forward!",
-            'backward': "Going backward!",
-            'left':     "Turning left!",
-            'right':    "Turning right!",
-        }
-        ack = ack_messages.get(direction, "Moving!")
-
-        # Speak acknowledgment in a thread so movement starts quickly
-        speak_thread = threading.Thread(
-            target=self.speech.speak, args=(ack,), daemon=True
-        )
-        speak_thread.start()
-
-        # Execute movement
-        success = self.nav.execute_move(direction)
+        # Execute movement FIRST (don't wait for TTS)
+        success = self.nav.execute_move(direction, duration=duration)
 
         if not success:
-            self.speech.speak("I can't move that way, there's something in front of me!")
+            # Only speak on failure (obstacle blocked)
+            self.speech._speak_fallback("Obstacle ahead!")
             self.face.set_emotion("surprise")
-            time.sleep(1)
+            time.sleep(0.5)
             self.face.set_emotion("neutral")
+
+    def _handle_keep_moving(self, command: dict):
+        """Handle continuous movement commands (keep going until stop)."""
+        direction = command.get('direction', 'forward')
+        logger.info(f"🔄 Starting continuous {direction} movement")
+        self.face.set_emotion("neutral")
+        self.speech._speak_fallback(f"Moving {direction}. Say stop to halt.")
+        self.nav.start_continuous_move(direction)
+
+    def _handle_safe_move(self, command: dict):
+        """Handle obstacle-aware careful movement."""
+        direction = command.get('direction', 'forward')
+        logger.info(f"🛡️ Safe move: {direction} with obstacle checking")
+        self.face.set_emotion("neutral")
+        self.speech._speak_fallback(f"Moving carefully. I'll stop if I see an obstacle.")
+        success = self.nav.safe_forward(duration=8.0)
+        if not success:
+            self.speech._speak_fallback("I stopped because I detected an obstacle ahead.")
+            self.face.set_emotion("surprise")
+            time.sleep(0.5)
+            self.face.set_emotion("neutral")
+        else:
+            self.speech._speak_fallback("Done! Path was clear.")
+
+    def _handle_patrol(self):
+        """Handle patrol / back-and-forth movement."""
+        logger.info("🔄 Starting patrol mode")
+        self.face.set_emotion("happy")
+        self.speech._speak_fallback("Patrolling! Say stop when you want me to halt.")
+        self.nav.start_patrol()
 
     def _handle_follow(self):
         """Handle follow-me command."""
@@ -204,13 +234,14 @@ class ECHO:
 
     def _handle_stop(self):
         """Handle stop command."""
+        self.nav.stop_continuous()  # Stop continuous/patrol modes too
         self.nav.emergency_stop()
         self.face.set_emotion("neutral")
-        self.speech.speak("Stopping!", emotion="neutral")
+        self.speech._speak_fallback("Stopped!")
 
     def _handle_chat(self, user_text: str, emotion: str, confidence: float):
         """Handle conversational input."""
-        # Update face to match detected emotion
+        # Show detected user emotion while thinking
         self.face.set_emotion(emotion)
 
         # Get Gemini response
@@ -219,11 +250,12 @@ class ECHO:
         if not response:
             response = "Hmm, I'm not sure what to say about that."
 
-        # Determine response emotion (could be different from detected)
-        # Simple heuristic: match the user's emotion for empathy
-        response_emotion = emotion
+        # Determine response emotion based on what ECHO says
+        response_emotion = self.brain.determine_response_emotion(response, emotion)
+        logger.info(f"🎭 Response emotion: {response_emotion}")
 
-        # Start talking animation
+        # Switch face to response emotion and start talking
+        self.face.set_emotion(response_emotion)
         self.face.set_talking(True)
 
         # Speak the response

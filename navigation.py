@@ -44,6 +44,8 @@ class NavigationController:
 
         self._follow_mode = False
         self._follow_thread = None
+        self._continuous_mode = False
+        self._continuous_thread = None
         self._running = False
         self._lock = threading.Lock()
 
@@ -201,24 +203,146 @@ class NavigationController:
     # Obstacle-Aware Continuous Move
     # ═══════════════════════════════════════════
 
-    def safe_forward(self, duration: float = 2.0, check_interval: float = 0.1):
+    def safe_forward(self, duration: float = 5.0, check_interval: float = 0.1):
         """
         Move forward while continuously checking for obstacles.
         Stops immediately if obstacle detected.
         """
+        if self._follow_mode:
+            self.stop_follow()
+        self._continuous_mode = True
         self.motors.forward()
         elapsed = 0.0
 
-        while elapsed < duration:
+        while elapsed < duration and self._continuous_mode:
             if self.sensors.is_obstacle_ahead():
                 self.motors.stop()
-                logger.warning("Obstacle! Stopped during safe_forward.")
+                logger.warning("⚠️ Obstacle detected! Stopped safely.")
+                self._continuous_mode = False
                 return False
             time.sleep(check_interval)
             elapsed += check_interval
 
         self.motors.stop()
+        self._continuous_mode = False
         return True
+
+    # ═══════════════════════════════════════════
+    # Continuous Movement (keep going until stop)
+    # ═══════════════════════════════════════════
+
+    def start_continuous_move(self, direction: str = 'forward'):
+        """
+        Start moving continuously in a direction until stop is called.
+        Checks obstacles every 100ms. Runs in background thread.
+        """
+        self.stop_continuous()  # Stop any existing continuous movement
+        if self._follow_mode:
+            self.stop_follow()
+
+        self._continuous_mode = True
+        self._continuous_thread = threading.Thread(
+            target=self._continuous_loop, args=(direction,), daemon=True
+        )
+        self._continuous_thread.start()
+        logger.info(f"🔄 Continuous {direction} movement STARTED")
+
+    def stop_continuous(self):
+        """Stop continuous movement."""
+        if self._continuous_mode:
+            self._continuous_mode = False
+            self.motors.stop()
+            logger.info("🛑 Continuous movement STOPPED")
+
+    @property
+    def is_continuous(self) -> bool:
+        return self._continuous_mode
+
+    def _continuous_loop(self, direction: str):
+        """Background loop for continuous movement with obstacle checking."""
+        move_fn = {
+            'forward': self.motors.forward,
+            'backward': self.motors.backward,
+        }.get(direction, self.motors.forward)
+
+        move_fn()  # Start moving (no duration = continuous)
+
+        while self._continuous_mode:
+            # Check obstacles for forward movement
+            if direction == 'forward' and self.sensors.is_obstacle_ahead():
+                self.motors.stop()
+                logger.warning("⚠️ Obstacle! Pausing continuous movement...")
+                # Wait until obstacle clears
+                while self._continuous_mode and self.sensors.is_obstacle_ahead():
+                    time.sleep(0.2)
+                if self._continuous_mode:
+                    logger.info("✅ Obstacle cleared, resuming movement")
+                    move_fn()
+            time.sleep(0.1)
+
+        self.motors.stop()
+
+    # ═══════════════════════════════════════════
+    # Patrol Mode (back and forth)
+    # ═══════════════════════════════════════════
+
+    def start_patrol(self, forward_duration: float = 3.0, pause: float = 1.0):
+        """
+        Patrol back and forth: forward → pause → backward → pause → repeat.
+        Stops on obstacle or when stop_continuous() is called.
+        """
+        self.stop_continuous()
+        if self._follow_mode:
+            self.stop_follow()
+
+        self._continuous_mode = True
+        self._continuous_thread = threading.Thread(
+            target=self._patrol_loop, args=(forward_duration, pause), daemon=True
+        )
+        self._continuous_thread.start()
+        logger.info("🔄 Patrol mode STARTED")
+
+    def _patrol_loop(self, fwd_dur: float, pause: float):
+        """Background loop for patrol movement."""
+        while self._continuous_mode:
+            # Forward leg
+            logger.info("🔄 Patrol: moving forward")
+            self.motors.forward()
+            elapsed = 0.0
+            while elapsed < fwd_dur and self._continuous_mode:
+                if self.sensors.is_obstacle_ahead():
+                    self.motors.stop()
+                    logger.warning("⚠️ Patrol: obstacle during forward, reversing early")
+                    break
+                time.sleep(0.1)
+                elapsed += 0.1
+            self.motors.stop()
+
+            if not self._continuous_mode:
+                break
+
+            # Pause
+            time.sleep(pause)
+            if not self._continuous_mode:
+                break
+
+            # Backward leg
+            logger.info("🔄 Patrol: moving backward")
+            self.motors.backward()
+            elapsed = 0.0
+            while elapsed < fwd_dur and self._continuous_mode:
+                time.sleep(0.1)
+                elapsed += 0.1
+            self.motors.stop()
+
+            if not self._continuous_mode:
+                break
+
+            # Pause
+            time.sleep(pause)
+
+        self.motors.stop()
+        self._continuous_mode = False
 
     # ═══════════════════════════════════════════
     # Cleanup
@@ -226,6 +350,7 @@ class NavigationController:
 
     def cleanup(self):
         """Stop all movement and clean up."""
+        self.stop_continuous()
         self.stop_follow()
         self.motors.stop()
         logger.info("NavigationController cleaned up")

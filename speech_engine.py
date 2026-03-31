@@ -16,9 +16,28 @@ import struct
 import logging
 import tempfile
 import threading
+import ctypes
 import numpy as np
 
 logger = logging.getLogger("echo.speech")
+
+# ── Suppress ALSA error spam ──────────────────────────────
+# ALSA prints harmless errors about missing PCM plugins during PyAudio init.
+# On systems with PipeWire, these errors can prevent proper device enumeration.
+# Suppressing them BEFORE importing pyaudio fixes the issue.
+try:
+    _ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, ctypes.c_int,
+        ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p
+    )
+    def _alsa_error_handler(filename, line, function, err, fmt):
+        pass  # Swallow ALSA errors silently
+    _c_alsa_handler = _ERROR_HANDLER_FUNC(_alsa_error_handler)
+    _asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+    _asound.snd_lib_error_set_handler(_c_alsa_handler)
+    logger.debug("ALSA error handler installed")
+except Exception:
+    pass  # Not on Linux / no ALSA — that's fine
 
 # Audio I/O
 try:
@@ -62,6 +81,10 @@ class SpeechEngine:
         self._whisper_model = None
         self._genai_client = None
         self._pyaudio = None
+        self._input_device_index = None
+        self._input_sample_rate = AUDIO_SAMPLE_RATE
+        self._output_device_index = None
+        self._output_device_name = "default"
         self._is_speaking = False
         self._lock = threading.Lock()
 
@@ -110,6 +133,83 @@ class SpeechEngine:
 
         try:
             self._pyaudio = pyaudio.PyAudio()
+
+            # ── Find input device (microphone) ──
+            input_name = ""
+            try:
+                info = self._pyaudio.get_default_input_device_info()
+                self._input_device_index = int(info.get("index"))
+                default_rate = int(info.get("defaultSampleRate", AUDIO_SAMPLE_RATE))
+                input_name = str(info.get("name", ""))
+                if default_rate > 0:
+                    self._input_sample_rate = default_rate
+                logger.info(f"Input device (default): idx={self._input_device_index} '{input_name}' @ {self._input_sample_rate} Hz")
+            except Exception:
+                # Default failed — scan all devices for a USB/external mic
+                logger.warning("Default input device not found, scanning all devices...")
+                usb_mic = None
+                any_mic = None
+                for i in range(self._pyaudio.get_device_count()):
+                    try:
+                        d = self._pyaudio.get_device_info_by_index(i)
+                        if int(d.get("maxInputChannels", 0)) <= 0:
+                            continue
+                        name = str(d.get("name", ""))
+                        logger.debug(f"  Input candidate: idx={i} '{name}'")
+                        if any_mic is None:
+                            any_mic = d
+                        # Prefer USB/external mic devices
+                        if any(kw in name.lower() for kw in ["usb", "zeb", "external", "webcam", "mic"]):
+                            usb_mic = d
+                            break
+                    except Exception:
+                        continue
+
+                chosen = usb_mic or any_mic
+                if chosen:
+                    self._input_device_index = int(chosen.get("index"))
+                    input_name = str(chosen.get("name", ""))
+                    rate = int(chosen.get("defaultSampleRate", AUDIO_SAMPLE_RATE))
+                    if rate > 0:
+                        self._input_sample_rate = rate
+                    logger.info(f"Input device (scanned): idx={self._input_device_index} '{input_name}' @ {self._input_sample_rate} Hz")
+                else:
+                    logger.error("No input device found! Mic will not work.")
+
+            # ── Find output device (speaker) ──
+            try:
+                selected_output = None
+                for i in range(self._pyaudio.get_device_count()):
+                    d = self._pyaudio.get_device_info_by_index(i)
+                    if int(d.get("maxOutputChannels", 0)) <= 0:
+                        continue
+                    if input_name and input_name in str(d.get("name", "")):
+                        selected_output = d
+                        break
+
+                if selected_output is None:
+                    try:
+                        selected_output = self._pyaudio.get_default_output_device_info()
+                    except Exception:
+                        # Default output also failed — find any output device
+                        logger.warning("Default output device not found, scanning...")
+                        for i in range(self._pyaudio.get_device_count()):
+                            d = self._pyaudio.get_device_info_by_index(i)
+                            if int(d.get("maxOutputChannels", 0)) > 0:
+                                selected_output = d
+                                break
+
+                if selected_output:
+                    self._output_device_index = int(selected_output.get("index"))
+                    self._output_device_name = str(selected_output.get("name", "default"))
+                    logger.info(
+                        f"Output device: idx={self._output_device_index} name='{self._output_device_name}'"
+                    )
+                else:
+                    logger.error("No output device found! Speaker will not work.")
+            except Exception as e:
+                logger.warning(f"Could not select output device, using system default: {e}")
+
             logger.info("PyAudio initialized")
         except Exception as e:
             logger.error(f"Failed to init PyAudio: {e}")
@@ -129,15 +229,15 @@ class SpeechEngine:
             return ""
 
         logger.info("🎤 Listening...")
-        audio_data = self._record_audio()
+        audio_data, sample_rate = self._record_audio()
 
         if not audio_data:
             logger.info("No audio captured")
             return ""
 
-        return self._transcribe(audio_data)
+        return self._transcribe(audio_data, sample_rate)
 
-    def _record_audio(self) -> bytes:
+    def _record_audio(self) -> tuple[bytes, int]:
         """
         Record from microphone with silence detection.
         Returns raw PCM audio bytes (16-bit, mono, 16kHz).
@@ -146,18 +246,39 @@ class SpeechEngine:
         FORMAT = pyaudio.paInt16
         frames = []
         silence_frames = 0
-        silence_limit = int(AUDIO_SILENCE_DURATION * AUDIO_SAMPLE_RATE / CHUNK)
-        max_frames = int(AUDIO_CHUNK_DURATION * AUDIO_SAMPLE_RATE / CHUNK)
         has_speech = False
+        selected_rate = self._input_sample_rate or AUDIO_SAMPLE_RATE
+
+        candidate_rates = []
+        for rate in [selected_rate, AUDIO_SAMPLE_RATE, 48000, 44100, 32000, 22050, 16000]:
+            if rate and rate not in candidate_rates:
+                candidate_rates.append(rate)
+
+        stream = None
+        for rate in candidate_rates:
+            try:
+                stream = self._pyaudio.open(
+                    format=FORMAT,
+                    channels=AUDIO_CHANNELS,
+                    rate=rate,
+                    input=True,
+                    input_device_index=self._input_device_index,
+                    frames_per_buffer=CHUNK,
+                )
+                selected_rate = rate
+                break
+            except Exception as e:
+                logger.warning(f"Mic open failed at {rate} Hz: {e}")
+
+        if stream is None:
+            logger.error("Recording error: could not open microphone at any supported sample rate")
+            return b"", AUDIO_SAMPLE_RATE
+
+        silence_limit = int(AUDIO_SILENCE_DURATION * selected_rate / CHUNK)
+        max_frames = int(AUDIO_CHUNK_DURATION * selected_rate / CHUNK)
 
         try:
-            stream = self._pyaudio.open(
-                format=FORMAT,
-                channels=AUDIO_CHANNELS,
-                rate=AUDIO_SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-            )
+            logger.info(f"Recording at {selected_rate} Hz")
 
             for _ in range(max_frames):
                 data = stream.read(CHUNK, exception_on_overflow=False)
@@ -181,15 +302,20 @@ class SpeechEngine:
             stream.close()
 
             if not has_speech:
-                return b""
+                return b"", selected_rate
 
-            return b"".join(frames)
+            return b"".join(frames), selected_rate
 
         except Exception as e:
             logger.error(f"Recording error: {e}")
-            return b""
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+            return b"", selected_rate
 
-    def _transcribe(self, audio_data: bytes) -> str:
+    def _transcribe(self, audio_data: bytes, sample_rate: int) -> str:
         """Transcribe raw PCM audio bytes using Faster Whisper."""
         if self._whisper_model is None:
             logger.error("Whisper model not loaded")
@@ -202,7 +328,7 @@ class SpeechEngine:
                 wf = wave.open(f, 'wb')
                 wf.setnchannels(AUDIO_CHANNELS)
                 wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(AUDIO_SAMPLE_RATE)
+                wf.setframerate(sample_rate)
                 wf.writeframes(audio_data)
                 wf.close()
 
@@ -308,38 +434,142 @@ class SpeechEngine:
         """Fallback TTS using espeak (works offline on RPi)."""
         try:
             import subprocess
-            # espeak: -s = speed (words per minute), -v = voice
-            cmd = ["espeak", "-s", "150", "-v", "en", text]
-            subprocess.run(cmd, timeout=30, capture_output=True)
+            # Write to WAV first, then play via pw-play for proper routing
+            tmp_wav = os.path.join(tempfile.gettempdir(), "echo_espeak.wav")
+            subprocess.run(
+                ["espeak", "-s", "150", "-v", "en", "-w", tmp_wav, text],
+                timeout=30, capture_output=True,
+            )
+            # Play the WAV through PipeWire
+            for cmd in [["pw-play", tmp_wav], ["aplay", tmp_wav]]:
+                try:
+                    r = subprocess.run(cmd, timeout=30, capture_output=True)
+                    if r.returncode == 0:
+                        break
+                except FileNotFoundError:
+                    continue
+            try:
+                os.unlink(tmp_wav)
+            except Exception:
+                pass
         except FileNotFoundError:
             logger.error("espeak not installed! Run: sudo apt install espeak")
         except Exception as e:
             logger.error(f"Fallback TTS error: {e}")
 
+    def _resample_pcm16_mono(self, audio_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
+        """Resample 16-bit mono PCM from src_rate to dst_rate."""
+        if src_rate == dst_rate or not audio_bytes:
+            return audio_bytes
+
+        samples = np.frombuffer(audio_bytes, dtype=np.int16)
+        if len(samples) < 2:
+            return audio_bytes
+
+        old_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+        new_len = max(1, int(len(samples) * (dst_rate / src_rate)))
+        new_x = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+        resampled = np.interp(new_x, old_x, samples.astype(np.float32))
+        return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
+
     def _play_audio_bytes(self, audio_bytes: bytes, sample_rate: int):
-        """Play raw PCM audio bytes through speakers."""
-        if not PYAUDIO_AVAILABLE or self._pyaudio is None:
-            logger.error("Cannot play audio — PyAudio not available")
+        """
+        Play raw PCM audio bytes through speakers.
+        Uses subprocess-based playback (pw-play / aplay) for reliability
+        on RPi with PipeWire. Falls back to PyAudio if neither is available.
+        """
+        if not audio_bytes:
+            logger.warning("No audio data to play")
             return
 
+        import subprocess
+
+        # Boost volume — Gemini TTS output can be quiet
         try:
-            stream = self._pyaudio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=sample_rate,
-                output=True,
-            )
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+            samples *= 2.0  # +6dB boost
+            samples = np.clip(samples, -32768, 32767)
+            audio_bytes = samples.astype(np.int16).tobytes()
+        except Exception:
+            pass  # Play original if boost fails
 
-            # Gemini TTS returns raw PCM 16-bit audio
-            CHUNK = 4096
-            for i in range(0, len(audio_bytes), CHUNK):
-                stream.write(audio_bytes[i:i + CHUNK])
-
-            stream.stop_stream()
-            stream.close()
-
+        # Write PCM data to a temporary WAV file
+        tmp_wav = os.path.join(tempfile.gettempdir(), "echo_tts_out.wav")
+        try:
+            with wave.open(tmp_wav, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_bytes)
         except Exception as e:
-            logger.error(f"Audio playback error: {e}")
+            logger.error(f"Failed to write temp WAV: {e}")
+            return
+
+        file_size = os.path.getsize(tmp_wav)
+        duration = len(audio_bytes) / (sample_rate * 2)  # 2 bytes per sample, mono
+        logger.info(f"Playing {duration:.1f}s audio ({file_size} bytes) @ {sample_rate} Hz")
+
+        # Try pw-play first (PipeWire native, most reliable)
+        played = False
+        for player_cmd in [
+            ["pw-play", tmp_wav],
+            ["aplay", tmp_wav],
+        ]:
+            try:
+                result = subprocess.run(
+                    player_cmd,
+                    capture_output=True, text=True,
+                    timeout=max(30, duration + 10),
+                )
+                if result.returncode == 0:
+                    logger.info(f"Audio playback OK via {player_cmd[0]}")
+                    played = True
+                    break
+                else:
+                    logger.warning(f"{player_cmd[0]} failed: {result.stderr.strip()[:100]}")
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                logger.warning(f"{player_cmd[0]} timed out")
+            except Exception as e:
+                logger.warning(f"{player_cmd[0]} error: {e}")
+
+        # Last resort: PyAudio playback
+        if not played and PYAUDIO_AVAILABLE and self._pyaudio is not None:
+            logger.info("Falling back to PyAudio playback...")
+            stream = None
+            try:
+                stream = self._pyaudio.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=sample_rate,
+                    output=True,
+                    output_device_index=self._output_device_index,
+                )
+                CHUNK = 4096
+                for i in range(0, len(audio_bytes), CHUNK):
+                    stream.write(audio_bytes[i:i + CHUNK])
+                stream.stop_stream()
+                stream.close()
+                logger.info("Audio playback OK via PyAudio")
+                played = True
+            except Exception as e:
+                logger.error(f"PyAudio playback error: {e}")
+                if stream:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+
+        if not played:
+            logger.error("All audio playback methods failed!")
+
+        # Clean up temp file
+        try:
+            os.unlink(tmp_wav)
+        except Exception:
+            pass
 
     @property
     def is_speaking(self) -> bool:

@@ -225,6 +225,21 @@ class CameraSentiment:
         x, y, w, h = faces_sorted[0]
         return (x + w // 2, y + h // 2)
 
+    def get_frame_jpeg(self, frame=None) -> bytes:
+        """
+        Get the current or given frame as JPEG bytes.
+        Used for Gemini API fallback sentiment analysis.
+        """
+        if frame is None:
+            frame = self.get_current_frame()
+        if frame is None:
+            return None
+
+        success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if success:
+            return buffer.tobytes()
+        return None
+
     @property
     def current_emotion(self) -> str:
         with self._lock:

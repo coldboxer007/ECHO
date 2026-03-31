@@ -79,13 +79,15 @@ class GeminiBrain:
             messages = [
                 types.Content(
                     role="user",
-                    parts=[types.Part.from_text(SYSTEM_PROMPT)]
+                    parts=[types.Part.from_text(text=SYSTEM_PROMPT)]
                 ),
                 types.Content(
                     role="model",
                     parts=[types.Part.from_text(
-                        "Understood! I'm ECHO, ready to be a warm and empathetic companion. "
-                        "I'll keep my responses concise and emotionally aware."
+                        text=(
+                            "Understood! I'm ECHO, ready to be a warm and empathetic companion. "
+                            "I'll keep my responses concise and emotionally aware."
+                        )
                     )]
                 ),
             ]
@@ -98,7 +100,7 @@ class GeminiBrain:
             # Add current user message
             user_content = types.Content(
                 role="user",
-                parts=[types.Part.from_text(full_message)]
+                parts=[types.Part.from_text(text=full_message)]
             )
             messages.append(user_content)
 
@@ -108,7 +110,7 @@ class GeminiBrain:
                 contents=messages,
                 config=types.GenerateContentConfig(
                     temperature=0.8,
-                    max_output_tokens=256,
+                    max_output_tokens=350,  # Rich conversational responses
                     top_p=0.9,
                 ),
             )
@@ -119,7 +121,7 @@ class GeminiBrain:
             # Update history
             model_content = types.Content(
                 role="model",
-                parts=[types.Part.from_text(reply)]
+                parts=[types.Part.from_text(text=reply)]
             )
 
             with self._lock:
@@ -137,32 +139,89 @@ class GeminiBrain:
         Parse user text to determine if it's a movement command or conversation.
 
         Returns dict with:
-            - 'type': 'move' | 'follow' | 'stop' | 'chat'
+            - 'type': 'move' | 'keep_moving' | 'safe_move' | 'patrol' | 'follow' | 'stop' | 'chat'
             - 'direction': 'forward' | 'backward' | 'left' | 'right' (for move)
+            - 'duration': optional float seconds
             - 'text': original text
         """
         text_lower = text.lower().strip()
+        words = text_lower.split()
 
-        # Movement commands
+        # ── PRIORITY 1: Complex / continuous movement commands ──
+        # Check these FIRST — they contain words like "stop when" and "obstacle"
+        # that would otherwise false-match the stop command.
+
+        # "keep moving", "keep going", "go until I say stop", "don't stop"
+        keep_kw = ['keep moving', 'keep going', 'until i say stop', 'don\'t stop',
+                   'keep driving', 'continue moving', 'continue going',
+                   'keep walking', 'go go go']
+        if any(kw in text_lower for kw in keep_kw):
+            direction = 'forward'
+            if any(w in text_lower for w in ['back', 'backward', 'backwards', 'reverse']):
+                direction = 'backward'
+            return {'type': 'keep_moving', 'direction': direction, 'text': text}
+
+        # "move carefully", "stop when there's an obstacle", "watch for obstacles"
+        safe_kw = ['carefully', 'watch for obstacle', 'stop when', 'obstacle',
+                   'slowly', 'be careful', 'watch out', 'stay your obstacle']
+        if any(kw in text_lower for kw in safe_kw) and \
+           any(w in text_lower for w in ['move', 'go', 'forward', 'drive', 'walk', 'until', 'stay']):
+            direction = 'forward'
+            if any(w in text_lower for w in ['back', 'backward', 'reverse']):
+                direction = 'backward'
+            return {'type': 'safe_move', 'direction': direction, 'text': text}
+
+        # "patrol", "go back and forth", "pace around"
+        patrol_kw = ['patrol', 'back and forth', 'pace', 'wander', 'explore', 'roam']
+        if any(kw in text_lower for kw in patrol_kw):
+            return {'type': 'patrol', 'text': text}
+
+        # ── PRIORITY 2: Explicit stop commands ──
+        # Only match unambiguous stop phrases — NOT "stay", "hold", "wait" which
+        # appear in movement sentences like "stop when there's an obstacle"
+        stop_phrases = ['stop', 'halt', 'freeze', 'stand still', 'don\'t move',
+                        'stop moving', 'stop following', 'shut down', 'cancel']
+        # Must be an explicit stop — not part of a movement sentence
+        if any(kw in text_lower for kw in stop_phrases):
+            # But don't trigger stop if there's ALSO a movement intent
+            has_move_word = any(w in text_lower for w in
+                               ['forward', 'go', 'move forward', 'backward', 'left', 'right',
+                                'keep', 'carefully', 'obstacle', 'patrol', 'until'])
+            if not has_move_word:
+                return {'type': 'stop', 'text': text}
+
+        # ── PRIORITY 3: Duration extraction: "go forward for 3 seconds" ──
+        duration = None
+        import re
+        dur_match = re.search(r'for\s+(\d+)\s*(?:second|sec|s\b)', text_lower)
+        if dur_match:
+            duration = float(dur_match.group(1))
+
+        # ── PRIORITY 4: Standard movement commands ──
         move_keywords = {
-            'forward':  ['move forward', 'go forward', 'go ahead', 'drive forward', 'move ahead'],
-            'backward': ['move backward', 'go backward', 'go back', 'reverse', 'move back', 'back up'],
-            'left':     ['turn left', 'go left', 'rotate left'],
-            'right':    ['turn right', 'go right', 'rotate right'],
+            'forward':  ['move forward', 'go forward', 'go ahead', 'drive forward', 'move ahead',
+                         'forward', 'straight', 'go straight', 'advance'],
+            'backward': ['move backward', 'go backward', 'go back', 'reverse', 'move back',
+                         'back up', 'backward', 'backwards', 'back'],
+            'left':     ['turn left', 'go left', 'rotate left', 'spin left', 'left'],
+            'right':    ['turn right', 'go right', 'rotate right', 'spin right', 'right'],
         }
 
         for direction, keywords in move_keywords.items():
             for kw in keywords:
                 if kw in text_lower:
-                    return {'type': 'move', 'direction': direction, 'text': text}
+                    cmd = {'type': 'move', 'direction': direction, 'text': text}
+                    if duration:
+                        cmd['duration'] = duration
+                    return cmd
+
+        # "spin", "turn around", "do a circle"
+        if any(kw in text_lower for kw in ['spin', 'turn around', 'circle', '360', 'rotate']):
+            return {'type': 'move', 'direction': 'right', 'duration': 2.0, 'text': text}
 
         # Follow commands
         if any(kw in text_lower for kw in ['follow me', 'follow', 'come with me', 'come here']):
             return {'type': 'follow', 'text': text}
-
-        # Stop commands
-        if any(kw in text_lower for kw in ['stop', 'halt', 'freeze', 'stay', 'stop following']):
-            return {'type': 'stop', 'text': text}
 
         # Everything else is conversation
         return {'type': 'chat', 'text': text}
@@ -231,6 +290,80 @@ class GeminiBrain:
         except Exception as e:
             logger.error(f"Person detection error: {e}")
             return {'found': False}
+
+    def analyze_emotion_from_image(self, image_bytes: bytes) -> tuple:
+        """
+        Fallback sentiment analysis using Gemini API.
+        Analyzes a camera frame to detect the primary facial emotion.
+
+        Args:
+            image_bytes: JPEG-encoded image bytes
+
+        Returns:
+            (emotion: str, confidence: float)
+        """
+        if self._client is None:
+            return "neutral", 0.0
+
+        try:
+            response = self._client.models.generate_content(
+                model=GEMINI_CHAT_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'),
+                    (
+                        "Analyze the person's facial expression in this image. "
+                        "Respond with ONLY a single JSON object: "
+                        '{"emotion": "<one of: happy, sad, angry, surprise, fear, disgust, neutral>", '
+                        '"confidence": <0.0-1.0>}. '
+                        'If no person is visible, return: {"emotion": "neutral", "confidence": 0.0}'
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=64,
+                ),
+            )
+
+            import json
+            text = response.text.strip()
+            # Clean markdown code fences if present
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            data = json.loads(text)
+
+            emotion = data.get("emotion", "neutral").lower()
+            confidence = float(data.get("confidence", 0.0))
+
+            valid_emotions = ["happy", "sad", "angry", "surprise", "fear", "disgust", "neutral"]
+            if emotion not in valid_emotions:
+                emotion = "neutral"
+                confidence = 0.0
+
+            logger.info(f"Gemini emotion fallback: {emotion} ({confidence:.0%})")
+            return emotion, confidence
+
+        except Exception as e:
+            logger.error(f"Gemini emotion analysis error: {e}")
+            return "neutral", 0.0
+
+    def determine_response_emotion(self, response_text: str, user_emotion: str) -> str:
+        """
+        Pick an appropriate display emotion for the robot's spoken response.
+        Analyzes keywords in the response to choose the best facial expression.
+        """
+        text = response_text.lower()
+
+        if any(w in text for w in ['sorry', 'sad', 'unfortunate', 'tough', 'difficult', 'condolence']):
+            return 'sad'
+        if any(w in text for w in ['happy', 'glad', 'great', 'wonderful', 'love', 'fantastic', 'awesome', 'exciting']):
+            return 'happy'
+        if any(w in text for w in ['wow', 'amazing', 'incredible', 'surprising', 'no way']):
+            return 'surprise'
+        if any(w in text for w in ['careful', 'danger', 'worried', 'scary', 'afraid']):
+            return 'fear'
+
+        # Mirror user's emotion for empathy; default to friendly happy for neutral
+        return user_emotion if user_emotion != 'neutral' else 'happy'
 
     def clear_history(self):
         """Clear conversation history."""

@@ -14,7 +14,7 @@ load_dotenv()
 # Gemini API
 # ─────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_CHAT_MODEL = "gemini-2.5-flash-preview-04-17"  # For conversation
+GEMINI_CHAT_MODEL = "gemini-2.5-flash"  # For conversation
 GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"     # For text-to-speech
 GEMINI_ROBOTICS_MODEL = "gemini-robotics-er-1.5-preview"  # For vision/spatial
 
@@ -41,7 +41,7 @@ MOTOR_MOVE_DURATION = 1.0   # seconds for default move command
 ULTRASONIC_TRIG = 16  # Trigger pin (GPIO 23)
 ULTRASONIC_ECHO = 18  # Echo pin    (GPIO 24)
 ULTRASONIC_TIMEOUT = 0.04  # 40ms timeout (~6.8m max range)
-OBSTACLE_DISTANCE_CM = 25  # Stop if obstacle closer than this
+OBSTACLE_DISTANCE_CM = 12  # Stop if obstacle closer than this (was 25, too sensitive)
 
 # ─────────────────────────────────────────────
 # IR Sensor
@@ -68,18 +68,18 @@ SENTIMENT_INTERVAL = 1.0  # Seconds between sentiment reads
 # ─────────────────────────────────────────────
 # Speech-to-Text (Faster Whisper)
 # ─────────────────────────────────────────────
-WHISPER_MODEL_SIZE = "base.en"  # "tiny.en" for fastest, "small.en" for better accuracy
+WHISPER_MODEL_SIZE = "tiny.en"  # tiny.en = ~2s transcription on RPi4 (base.en took 15s!)
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"   # int8 is best for RPi CPU
 WHISPER_LANGUAGE = "en"
-WHISPER_BEAM_SIZE = 3
+WHISPER_BEAM_SIZE = 1  # Greedy decode — ~10x faster on RPi CPU (was 3, took 24s!)
 
 # Audio recording settings
 AUDIO_SAMPLE_RATE = 16000  # 16kHz for Whisper
 AUDIO_CHANNELS = 1
-AUDIO_CHUNK_DURATION = 5   # Max seconds per voice command recording
-AUDIO_SILENCE_THRESHOLD = 500  # RMS threshold for silence detection
-AUDIO_SILENCE_DURATION = 1.5   # Seconds of silence before stopping recording
+AUDIO_CHUNK_DURATION = 5   # Max seconds per voice command recording (was 8, too long)
+AUDIO_SILENCE_THRESHOLD = 150  # RMS threshold for silence detection (tuned for Zeb SoundMX USB mic)
+AUDIO_SILENCE_DURATION = 1.0   # Seconds of silence before stopping recording (was 1.5)
 
 # ─────────────────────────────────────────────
 # Text-to-Speech (Gemini TTS)
@@ -101,7 +101,7 @@ AUDIO_OUTPUT = "headphones"  # "headphones" = 3.5mm jack, "hdmi" = HDMI audio
 # ─────────────────────────────────────────────
 DISPLAY_WIDTH = 800   # 5-inch HDMI display native width
 DISPLAY_HEIGHT = 480  # 5-inch HDMI display native height
-DISPLAY_FPS = 30
+DISPLAY_FPS = 20  # 20fps is plenty for robot face, saves CPU for Whisper
 DISPLAY_FULLSCREEN = True  # Fullscreen for robot kiosk mode
 
 # Emotion → face color mapping
@@ -128,8 +128,11 @@ FOLLOW_LOST_TIMEOUT = 3.0         # Seconds before stopping if person lost
 # ─────────────────────────────────────────────
 SYSTEM_PROMPT = """You are ECHO, a friendly and emotionally intelligent companion robot.
 You can see people's emotions through your camera and you respond with empathy and warmth.
-Keep your responses concise (1-3 sentences) since they'll be spoken aloud.
+Speak naturally in 2-5 sentences — give thoughtful, detailed responses that feel like a real conversation.
+Don't be too brief! If someone asks a question, give a helpful, engaging answer with personality.
 If the user seems sad, be comforting. If happy, share their joy. If angry, be calm and understanding.
-You have a physical robot body and can move around. You're curious and helpful.
+You have a physical robot body with wheels and sensors. You can move forward, backward, turn, and avoid obstacles.
+You're curious, helpful, and love chatting. You remember what was said earlier in the conversation.
 When given an emotion tag like [EMOTION: happy], factor that into your response tone.
+You understand complex movement commands like 'keep moving', 'go forward carefully', 'patrol around'.
 Never mention that you're an AI language model — you are ECHO, a robot companion."""
