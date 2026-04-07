@@ -232,8 +232,8 @@ class GeminiBrain:
 
         Returns dict with:
             - 'type': 'move' | 'keep_moving' | 'safe_move' | 'patrol' |
-                      'follow' | 'stop' | 'clear_history' | 'look' |
-                      'volume' | 'chat'
+                      'follow' | 'stop' | 'goodbye' | 'clear_history' |
+                      'look' | 'volume' | 'chat'
             - 'direction': 'forward' | 'backward' | 'left' | 'right' (for move)
             - 'duration': optional float seconds
             - 'volume_direction': 'up' | 'down' (for volume)
@@ -271,11 +271,21 @@ class GeminiBrain:
         if any(kw in text_lower for kw in patrol_kw):
             return {'type': 'patrol', 'text': text}
 
-        # ── PRIORITY 2: Explicit stop commands ──
+        # ── PRIORITY 2a: Goodbye / shutdown commands ──
+        # Graceful shutdown — must come before 'stop' so "shut down" and
+        # "goodbye" trigger a full shutdown, not just a motor stop.
+        goodbye_phrases = ['goodbye', 'good bye', 'bye bye', 'bye echo',
+                           'goodnight', 'good night', 'shut down', 'power off',
+                           'turn off', 'go to sleep', 'see you later',
+                           'see you soon', 'i\'m leaving', 'time to sleep']
+        if any(kw in text_lower for kw in goodbye_phrases):
+            return {'type': 'goodbye', 'text': text}
+
+        # ── PRIORITY 2b: Explicit stop commands ──
         # Only match unambiguous stop phrases — NOT "stay", "hold", "wait" which
         # appear in movement sentences like "stop when there's an obstacle"
         stop_phrases = ['stop', 'halt', 'freeze', 'stand still', 'don\'t move',
-                        'stop moving', 'stop following', 'shut down', 'cancel']
+                        'stop moving', 'stop following', 'cancel']
         # Must be an explicit stop — not part of a movement sentence
         if any(kw in text_lower for kw in stop_phrases):
             # But don't trigger stop if there's ALSO a movement intent
@@ -369,6 +379,7 @@ class GeminiBrain:
                 '- {"type":"move","direction":"left"} — turn left\n'
                 '- {"type":"move","direction":"right"} — turn right\n'
                 '- {"type":"stop"} — stop moving (includes: wait, hold on, stay)\n'
+                '- {"type":"goodbye"} — user is saying goodbye/leaving (includes: goodbye, bye, see you later, goodnight, shut down, power off, go to sleep)\n'
                 '- {"type":"follow"} — follow the person\n'
                 '- {"type":"patrol"} — patrol/explore\n'
                 '- {"type":"chat"} — not a movement command, just conversation\n\n'
@@ -399,7 +410,7 @@ class GeminiBrain:
                 if direction in ("forward", "backward", "left", "right"):
                     logger.info(f"🧠 NLP classified as move:{direction}")
                     return {'type': 'move', 'direction': direction, 'text': text}
-            elif cmd_type in ("stop", "follow", "patrol"):
+            elif cmd_type in ("stop", "follow", "patrol", "goodbye"):
                 logger.info(f"🧠 NLP classified as {cmd_type}")
                 return {'type': cmd_type, 'text': text}
 
@@ -534,6 +545,8 @@ class GeminiBrain:
         """
         Pick an appropriate display emotion for the robot's spoken response.
         Analyzes keywords in the response to choose the best facial expression.
+        Prioritizes matching the response content; mirrors user emotion for empathy;
+        defaults to neutral so the face doesn't appear stuck in one expression.
         """
         text = response_text.lower()
 
@@ -546,8 +559,9 @@ class GeminiBrain:
         if any(w in text for w in ['careful', 'danger', 'worried', 'scary', 'afraid']):
             return 'fear'
 
-        # Mirror user's emotion for empathy; default to friendly happy for neutral
-        return user_emotion if user_emotion != 'neutral' else 'happy'
+        # Mirror user's emotion for empathy; default to neutral (not happy)
+        # so the face naturally reflects context rather than always smiling.
+        return user_emotion
 
     def clear_history(self):
         """Clear conversation history."""

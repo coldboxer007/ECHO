@@ -22,6 +22,9 @@ import threading
 import traceback
 from datetime import datetime
 
+import cv2
+import numpy as np
+
 # ─── Logging Setup (DEBUG level for max detail) ───
 logging.basicConfig(
     level=logging.DEBUG,
@@ -36,7 +39,10 @@ logger = logging.getLogger("echo.debug")
 
 # Import the base ECHO class
 from main import ECHO
-from config import WAKE_WORD_ENABLED, WAKE_WORD_PHRASES, CAMERA_WIDTH, CAMERA_HEIGHT
+from config import (
+    WAKE_WORD_ENABLED, WAKE_WORD_PHRASES, CAMERA_WIDTH, CAMERA_HEIGHT,
+    SENTIMENT_LABELS, EMOTION_COLORS,
+)
 
 
 # ═══════════════════════════════════════════════════
@@ -103,7 +109,7 @@ class ECHODebug(ECHO):
         self._loop_count = 0
         self._listen_count = 0
         self._speak_count = 0
-        self._cmd_counts = {"chat": 0, "move": 0, "follow": 0, "stop": 0}
+        self._cmd_counts = {"chat": 0, "move": 0, "follow": 0, "stop": 0, "goodbye": 0}
 
         banner("✅ All subsystems initialized — DEBUG MODE")
 
@@ -126,6 +132,12 @@ class ECHODebug(ECHO):
         )
         self._sensor_thread.start()
 
+        # Debug-specific: camera preview + confidence meter window
+        self._camera_thread = threading.Thread(
+            target=self._camera_debug_loop, daemon=True
+        )
+        self._camera_thread.start()
+
         # Startup greeting
         time.sleep(1)
         self.face.set_emotion("happy")
@@ -144,7 +156,8 @@ class ECHODebug(ECHO):
             "",
             "All inputs and outputs are printed below.",
             "Sensor data printed every 5 seconds.",
-            "Press Ctrl+C to stop.",
+            "Camera preview window with confidence meter.",
+            "Press 'q' in camera window or Ctrl+C to stop.",
         ])
         print()
 
@@ -173,6 +186,98 @@ class ECHODebug(ECHO):
             except Exception:
                 pass
             time.sleep(5)
+
+    def _camera_debug_loop(self):
+        """Show OpenCV window with live camera feed, face detection boxes,
+        emotion label, and per-emotion confidence bar chart.
+        Runs at ~10fps to keep CPU light. Fails silently on headless setups."""
+        WINDOW_NAME = "ECHO Debug — Camera + Confidence"
+        try:
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_NAME, 640, 480)
+        except Exception:
+            dp("CAMERA", "Cannot open debug window (headless?). Skipping camera preview.", C_YELLOW)
+            return
+
+        # BGR colors for each emotion (derived from config RGB, swapped to BGR)
+        emo_bgr = {}
+        for label, rgb in EMOTION_COLORS.items():
+            emo_bgr[label] = (rgb[2], rgb[1], rgb[0])
+
+        while self._running:
+            try:
+                frame = self.camera.get_current_frame()
+                if frame is None:
+                    time.sleep(0.1)
+                    continue
+
+                # ── Draw face detection boxes ──
+                faces = self.camera.detect_faces(frame)
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                # ── Overlay current emotion label + confidence ──
+                emo = self.camera.current_emotion
+                conf = self.camera.current_confidence
+                label_text = f"{emo.upper()} ({conf:.0%})"
+                color = emo_bgr.get(emo, (200, 200, 200))
+                cv2.putText(frame, label_text, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+
+                # ── Per-emotion confidence bar chart (bottom of frame) ──
+                bar_h = 12          # Height of each bar
+                bar_max_w = 150     # Max bar width in pixels
+                bar_x = 10          # Left edge
+                bar_y_start = frame.shape[0] - (len(SENTIMENT_LABELS) * (bar_h + 4)) - 10
+
+                # Semi-transparent background for readability
+                overlay_y1 = max(0, bar_y_start - 5)
+                overlay_y2 = frame.shape[0]
+                overlay = frame[overlay_y1:overlay_y2, 0:bar_x + bar_max_w + 80].copy()
+                cv2.rectangle(frame, (0, overlay_y1), (bar_x + bar_max_w + 80, overlay_y2),
+                              (0, 0, 0), -1)
+                # Blend: 60% black overlay, 40% original
+                frame[overlay_y1:overlay_y2, 0:bar_x + bar_max_w + 80] = \
+                    cv2.addWeighted(frame[overlay_y1:overlay_y2, 0:bar_x + bar_max_w + 80],
+                                    0.6, overlay, 0.4, 0)
+
+                scores = self.camera._emotion_scores
+                for i, label in enumerate(SENTIMENT_LABELS):
+                    score = scores.get(label, 0.0)
+                    y_pos = bar_y_start + i * (bar_h + 4)
+                    bar_w = int(score * bar_max_w)
+                    bar_color = emo_bgr.get(label, (200, 200, 200))
+
+                    # Label text
+                    cv2.putText(frame, f"{label[:3]}", (bar_x, y_pos + bar_h - 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                    # Bar background
+                    cv2.rectangle(frame, (bar_x + 30, y_pos),
+                                  (bar_x + 30 + bar_max_w, y_pos + bar_h),
+                                  (40, 40, 40), -1)
+                    # Bar fill
+                    if bar_w > 0:
+                        cv2.rectangle(frame, (bar_x + 30, y_pos),
+                                      (bar_x + 30 + bar_w, y_pos + bar_h),
+                                      bar_color, -1)
+                    # Percentage
+                    cv2.putText(frame, f"{score:.0%}",
+                                (bar_x + 30 + bar_max_w + 4, y_pos + bar_h - 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
+
+                cv2.imshow(WINDOW_NAME, frame)
+                key = cv2.waitKey(100) & 0xFF  # ~10fps, also pumps event queue
+                if key == ord('q'):
+                    dp("CAMERA", "Debug camera window closed by user (q)", C_YELLOW)
+                    break
+
+            except Exception:
+                time.sleep(0.5)
+
+        try:
+            cv2.destroyWindow(WINDOW_NAME)
+        except Exception:
+            pass
 
     def _main_loop(self):
         """Core debug loop — same as ECHO but with print statements."""
@@ -214,7 +319,7 @@ class ECHODebug(ECHO):
                     dp("WAKE", f"Wake word '{matched_phrase}' detected", C_GREEN)
                     if not user_text:
                         dp("WAKE", "Just wake word, no command — saying 'Yes?'", C_YELLOW)
-                        self.speech.speak("Yes?", force_fallback=True)
+                        self.speech.speak("Yes?", emotion="neutral")
                         self._speak_count += 1
                         continue
 
@@ -273,6 +378,8 @@ class ECHODebug(ECHO):
                     self._handle_follow()
                 elif cmd_type == 'stop':
                     self._handle_stop()
+                elif cmd_type == 'goodbye':
+                    self._handle_goodbye()
                 elif cmd_type == 'clear_history':
                     self._handle_clear_history()
                 elif cmd_type == 'look':
@@ -345,6 +452,11 @@ class ECHODebug(ECHO):
         dp("STOP", "🛑 Emergency stop!", C_RED)
         super()._handle_stop()
         self._speak_count += 1
+
+    def _handle_goodbye(self):
+        """Handle goodbye / shutdown with debug output."""
+        dp("GOODBYE", "👋 Goodbye command — initiating shutdown", C_YELLOW)
+        super()._handle_goodbye()
 
     def _handle_clear_history(self):
         """Handle clear history with debug output."""
@@ -432,6 +544,12 @@ class ECHODebug(ECHO):
         """Clean shutdown with summary."""
         banner("🤖 ECHO — Shutting Down (DEBUG)")
 
+        # Close camera debug window if open
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
         # Call base class shutdown (cleans up all subsystems)
         super().shutdown()
 
@@ -447,6 +565,7 @@ class ECHODebug(ECHO):
             f"Move commands:     {self._cmd_counts.get('move', 0)}",
             f"Follow commands:   {self._cmd_counts.get('follow', 0)}",
             f"Stop commands:     {self._cmd_counts.get('stop', 0)}",
+            f"Goodbye commands:  {self._cmd_counts.get('goodbye', 0)}",
         ])
         print()
         banner("✅ ECHO shutdown complete")

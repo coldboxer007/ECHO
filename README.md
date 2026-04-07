@@ -127,6 +127,7 @@ User speaks → Mic captures audio (PyAudio @ 44100Hz)
       ├─ Keep moving → Background thread, auto-pause on obstacle
       ├─ Patrol → Back-and-forth loop with obstacle awareness
       ├─ Stop → Emergency stop all motors
+      ├─ Goodbye → Graceful shutdown (stops motors, speaks farewell, cleans up subsystems)
       ├─ Follow → Camera face tracking + variable-speed motor steering
       ├─ Look → Captures camera frame → Gemini vision analysis → speaks description
       ├─ Volume → Adjusts TTS playback volume (louder/quieter)
@@ -338,7 +339,7 @@ The loop skips listening while the robot is speaking (to avoid hearing its own v
 
 The brain has multiple functions:
 
-1. **Command interpretation** (`interpret_command`): Parses user text to determine if it's a movement command, utility command, or conversation. Uses a **priority-based keyword matching system** (see [Command Routing](#command-routing--priority-system) below). Returns one of 10 command types: `move`, `keep_moving`, `safe_move`, `patrol`, `follow`, `stop`, `clear_history`, `look`, `volume`, `chat`.
+1. **Command interpretation** (`interpret_command`): Parses user text to determine if it's a movement command, utility command, or conversation. Uses a **priority-based keyword matching system** (see [Command Routing](#command-routing--priority-system) below). Returns one of 11 command types: `move`, `keep_moving`, `safe_move`, `patrol`, `follow`, `stop`, `goodbye`, `clear_history`, `look`, `volume`, `chat`.
 
 2. **Hybrid NLP fallback** (`interpret_command_nlp`): When local keyword matching returns `chat`, a Gemini API call classifies the phrase as a potential movement command. This catches natural language like "come ahead", "move closer", or "go that way" that local keywords miss. Only called as a fallback to avoid unnecessary API calls.
 
@@ -348,7 +349,7 @@ The brain has multiple functions:
 
 5. **Scene analysis** (`analyze_scene`): Sends a camera frame JPEG to Gemini vision for description. Triggered by "what do you see", "look around", etc.
 
-6. **Emotion determination** (`determine_response_emotion`): Analyzes Gemini's response text for emotional keywords to choose the appropriate face animation.
+6. **Emotion determination** (`determine_response_emotion`): Analyzes Gemini's response text for emotional keywords to choose the appropriate face animation. Mirrors the user's detected emotion for empathy; defaults to neutral (not happy) so the face naturally reflects context rather than always smiling.
 
 7. **History management** (`clear_history`): Resets conversation memory on voice command.
 
@@ -420,6 +421,12 @@ A full-screen pygame animation running at 20fps on the HDMI display:
 - **Two large eyes** positioned at 25% and 75% of screen width
 - **Centered mouth** at 78% of screen height
 - **7 emotions:** happy, sad, angry, surprise, fear, disgust, neutral — each with unique eye shapes, mouth curves, and color schemes
+- **Happy eyes:** Full round white eyes with iris/pupil/gleam and a curved lower-eyelid squint, giving a warm smiling look (not half-moon arcs)
+- **Tear drops:** Sad emotion draws small falling tear ellipses below the eyes
+- **Gleam highlights:** All emotions now have a small white gleam dot on the pupil for liveliness
+- **Fear idle mouth:** Wavy trembling mouth animation driven by idle phase (not talk phase), so it animates even when silent
+- **Scan line overlay:** Drawn on top of all face elements (eyes, mouth, eyebrows) for consistent CRT effect
+- **Angry vein lines:** Made more visible with brighter accent color
 - **Shape-morphing transitions:** Per-emotion geometry defined in `_EYE_PARAMS` and `_MOUTH_PARAMS` dicts, with smooth interpolation via `_emotion_blend` factor (~0.33 second morph)
 - **Emotion-specific eyebrows:** Neutral gets subtle flat lines, happy gets raised arcs, sad droops, angry slants inward, surprise lifts high, fear angles up, disgust furrows asymmetrically
 - **Camera-directed gaze tracking:** `set_gaze(x, y)` API accepts -1.0 to 1.0 coordinates from face detection. Overrides random pupil wander. Auto-expires after 3 seconds of no updates (resumes wander)
@@ -469,7 +476,12 @@ Priority 1: Complex / continuous movement
     ├── safe_move    → "carefully", "stop when obstacle", "watch out"
     └── patrol       → "patrol", "back and forth", "explore"
 
-Priority 2: Explicit stop (with disambiguation)
+Priority 2a: Goodbye / shutdown
+    └── goodbye   → "goodbye", "bye bye", "goodnight", "shut down", "power off",
+                     "go to sleep", "see you later"
+        Checked BEFORE stop so "shut down" triggers full shutdown, not motor stop
+
+Priority 2b: Explicit stop (with disambiguation)
     └── stop         → "stop", "halt", "freeze"
         BUT ONLY IF no movement words are also present
         (prevents "stop when obstacle" from triggering stop)
@@ -513,6 +525,7 @@ Priority 7: Chat (default)
 | **Follow** | "follow me" | Camera tracks largest face, variable-speed PWM steering (slow=45% for turns, fast=80% for approach), maintains ~80cm distance |
 | **Spin** | "spin", "turn around" | Right turn for 2 seconds |
 | **Emergency stop** | "stop", "halt", "freeze" | Immediately stops all motors and background movement modes |
+| **Goodbye** | "goodbye", "shut down", "goodnight" | Graceful full shutdown — stops motors, speaks farewell, cleans up all subsystems |
 
 ---
 
@@ -530,7 +543,7 @@ The primary mode. Uses Faster-Whisper for local STT + Gemini for conversation + 
 ```bash
 python3 debug_main.py
 ```
-Same functionality as standard mode — `ECHODebug` inherits from the `ECHO` class and adds verbose, color-coded terminal output. Shows every sensor reading, command interpretation, API call, streaming sentence, gaze tracking, and timing breakdown in real-time. Best for development and troubleshooting. Overrides handler methods to add debug logging while delegating to the base class via `super()`. Includes the full streaming think→TTS pipeline, hybrid NLP fallback, and gaze tracking — all with debug output.
+Same functionality as standard mode — `ECHODebug` inherits from the `ECHO` class and adds verbose, color-coded terminal output. Shows every sensor reading, command interpretation, API call, streaming sentence, gaze tracking, and timing breakdown in real-time. Includes a **live camera preview window** (OpenCV) showing the camera feed with face detection bounding boxes, current emotion label, and a per-emotion confidence bar chart — useful for monitoring the TFLite model's performance in real time. Also tracks session statistics (loop count, speech I/O, command breakdown including goodbye). Best for development and troubleshooting. Overrides handler methods to add debug logging while delegating to the base class via `super()`. Includes the full streaming think→TTS pipeline, hybrid NLP fallback, and gaze tracking — all with debug output.
 
 ### Live API Mode (live_main.py)
 ```bash
@@ -883,6 +896,12 @@ Pure keyword matching misses natural language movement phrases like "come ahead"
 ### 15. PWM made optional
 Some RPi setups have issues with software PWM (timing jitter, lgpio conflicts). The `MOTOR_PWM_ENABLED` flag allows falling back to simple GPIO on/off mode. All motor methods branch internally — `navigation.py` and callers don't need changes. `set_speed()` is a no-op in GPIO mode.
 
+### 16. Consistent TTS voice across all speech
+Movement acknowledgments ("Moving forward!", "Stopped!") originally used `force_fallback=True` to skip Gemini TTS for speed. However, this produced a jarring voice switch — the robot would chat in Kore (Gemini TTS) then bark orders in espeak's robotic voice. Round 4 removed all `force_fallback=True` calls so every utterance uses the same Gemini TTS voice, maintaining personality consistency.
+
+### 17. Goodbye as a separate command type
+"Shut down" was originally in the stop keyword list, which only stopped motors. Round 4 elevated goodbye/shutdown phrases to their own command type at priority 2a (before stop), triggering a full graceful shutdown: motors stop, `_running = False` breaks the main loop, `shutdown()` speaks farewell and cleans up all subsystems in reverse order.
+
 ---
 
 ## Future Directions
@@ -925,9 +944,21 @@ Some RPi setups have issues with software PWM (timing jitter, lgpio conflicts). 
 
 18. ~~**Face Display Overhaul**~~ — **DONE (Round 3).** Shape-morphing transitions, emotion-specific eyebrows, camera-directed gaze tracking, all-emotion talking mouths, pupil behaviors, brighter blush, reaction animations (bounce/shake), and curved eyelid blinks.
 
+19. ~~**Goodbye / Graceful Shutdown**~~ — **DONE (Round 4).** Voice-triggered shutdown: "goodbye", "shut down", "goodnight", etc. Stops motors, speaks farewell, cleans up all subsystems. Added at priority 2a (before stop) so "shut down" doesn't just stop motors.
+
+20. ~~**Voice Consistency**~~ — **DONE (Round 4).** All speech output now uses Gemini TTS (Kore voice) consistently. Previously, movement acknowledgments used `force_fallback=True` which bypassed Gemini TTS and used espeak — producing a jarring voice change. Removed all `force_fallback=True` calls.
+
+21. ~~**Face Polish — Happy Eyes, Tears, Gleams**~~ — **DONE (Round 4).** Happy eyes rewritten as full round eyes with squint (not half-moon arcs). Sad emotion gets tear drops. All emotions get gleam highlights. Fear idle mouth trembles correctly. Scan lines drawn on top of face elements. CPU-safe (simple circles/lines only).
+
+22. ~~**Emotion Mirroring**~~ — **DONE (Round 4).** Face now mirrors the user's detected emotion instead of defaulting to happy. `determine_response_emotion()` returns the user's emotion for empathy, rather than forcing happy for neutral users.
+
+23. ~~**Debug Camera Preview**~~ — **DONE (Round 4).** OpenCV window in debug_main.py showing live camera feed with face detection boxes, emotion label overlay, and per-emotion EMA confidence bar chart for monitoring TFLite model performance.
+
+24. **Multi-Language Support** — **INVESTIGATED (Round 4).** Pipeline is compatible: switch Whisper from `tiny.en` to `tiny` (multilingual), set `WHISPER_LANGUAGE` to target language or `None` for auto-detect, update system prompt. Gemini chat and TTS handle multiple languages natively. Main friction: command keyword lists are English-only, but the NLP fallback via Gemini handles other languages. Config-level switch when needed.
+
 ### Known Limitations
 
-- **Single-language** — English only (Whisper tiny.en)
+- **Single-language by default** — English only (Whisper tiny.en), but pipeline supports switching to multilingual mode via config (see Future Directions #24)
 - **TFLite runtime optional** — sentiment defaults to "neutral" without it; model output is softmax-normalized for correct probability interpretation
 - **WiFi dependent** — Gemini API requires internet connectivity
 - **5V/3.3V mismatch** — HC-SR04 ECHO pin needs a voltage divider

@@ -474,10 +474,6 @@ class FaceDisplay:
         # ── Clear screen ──
         self._screen.fill(bg_color)
 
-        # ── Pre-rendered scan lines overlay (created once in _init_display) ──
-        if self._scan_overlay is not None:
-            self._screen.blit(self._scan_overlay, (0, 0))
-
         # ── Eye sockets (subtle dark panels behind eyes) ──
         socket_r = self.EYE_RADIUS + 22
         for ex in [self.LEFT_EYE_X, self.RIGHT_EYE_X]:
@@ -505,6 +501,26 @@ class FaceDisplay:
         mouth_x = int(self.MOUTH_X + reaction_dx)
         self._draw_mouth(mouth_x, mouth_y, emotion, is_talking,
                         talk_offset, accent, self._talk_amplitude)
+
+        # ── Tear drops for sad emotion ──
+        if emotion == "sad":
+            tear_phase = self._idle_phase * 1.5
+            for tear_ex in [self.LEFT_EYE_X, self.RIGHT_EYE_X]:
+                # Tear falls slowly, repeating every ~3 seconds
+                tear_y_offset = (tear_phase % 3.0) / 3.0  # 0.0→1.0 cycle
+                tear_y = int(self.EYE_Y + self.EYE_RADIUS * 0.8 + tear_y_offset * self.EYE_RADIUS * 1.2 + breath)
+                tear_x = int(tear_ex + self.EYE_RADIUS * 0.15 + reaction_dx)
+                # Fade out as tear falls
+                tear_alpha_frac = max(0.1, 1.0 - tear_y_offset * 0.8)
+                tear_col = (max(0, int(accent[0] * tear_alpha_frac * 0.6)),
+                           max(0, int(accent[1] * tear_alpha_frac * 0.6)),
+                           max(0, int(accent[2] * tear_alpha_frac * 0.6)))
+                pygame.draw.ellipse(self._screen, tear_col,
+                                   (tear_x - 3, tear_y, 6, 10))
+
+        # ── Pre-rendered scan lines overlay ON TOP for holographic effect ──
+        if self._scan_overlay is not None:
+            self._screen.blit(self._scan_overlay, (0, 0))
 
         # ── Status indicator at bottom ──
         try:
@@ -547,17 +563,39 @@ class FaceDisplay:
         m_pupil = self._morph_pupil
 
         if emotion == "happy":
-            # ── Happy: upward arc (^ ^) -- anime style ──
-            arc_w = int(R * 2.6)
-            arc_h = int(R * 2.0 * v_scale)
-            rect = (cx - arc_w // 2, cy - arc_h // 2, arc_w, arc_h)
-            self._draw_glow_arc(rect, 0.15, math.pi - 0.15, accent, width=6)
-            # Add sparkle dots for extra happy
-            if v_scale > 0.5:
-                sparkle_r = int(R * 0.08)
-                sx = cx + int(R * 0.5 * (-1 if is_left else 1))
-                sy = cy - int(R * 0.5 * v_scale)
-                pygame.draw.circle(self._screen, (255, 255, 255), (sx, sy), sparkle_r)
+            # ── Happy: full round eyes with joyful squint ──
+            # Draw a full circle eye (not just an arc) so the eyes look complete.
+            # A curved lower eyelid gives the squinting happy look.
+            ow = int(R * m_ow)
+            oh = int(R * m_oh * v_scale)
+            # Full white eye
+            pygame.draw.circle(self._screen, white, (cx, cy), int(R * 1.0))
+            # Iris with wander
+            iris_r = int(R * m_iris)
+            ix = cx + pupil_dx
+            iy = cy + pupil_dy
+            pygame.draw.circle(self._screen, accent, (ix, iy), iris_r)
+            # Pupil
+            pupil_r = int(iris_r * m_pupil)
+            pygame.draw.circle(self._screen, pupil_color, (ix, iy), pupil_r)
+            # Gleam highlight
+            gleam_r = int(R * 0.10)
+            gx = cx - int(R * 0.22) + pupil_dx // 3
+            gy = cy - int(R * 0.22) + pupil_dy // 3
+            pygame.draw.circle(self._screen, (255, 255, 255), (gx, gy), gleam_r)
+            # Glow ring
+            self._draw_glow_circle((cx, cy), int(R * 1.0), accent, layers=2)
+            # Happy squint: curved lower eyelid covering bottom ~30% of eye
+            # (background-colored ellipse overlapping the lower part)
+            squint_h = int(R * 0.75 * v_scale)
+            squint_w = int(R * 2.6)
+            squint_y = cy + int(R * 0.35)
+            pygame.draw.ellipse(self._screen, (10, 12, 18),
+                               (cx - squint_w // 2, squint_y, squint_w, squint_h))
+            # Curved lower eyelid edge (glowing arc along the squint boundary)
+            edge_rect = (cx - squint_w // 2, squint_y - 4, squint_w, 14)
+            self._draw_glow_arc(edge_rect, math.pi + 0.2, 2 * math.pi - 0.2,
+                               accent, width=3, layers=1)
             # ── Happy eyebrows: gentle raised arcs ──
             brow_y = cy - int(R * 1.0 * v_scale) - 12
             bw = int(R * 0.8)
@@ -582,6 +620,10 @@ class FaceDisplay:
             pygame.draw.circle(self._screen, accent, (ix, iy), iris_r)
             pupil_r = int(iris_r * m_pupil)
             pygame.draw.circle(self._screen, pupil_color, (ix, iy), pupil_r)
+            # Gleam highlight (watery eye look)
+            gleam_r = int(R * 0.08)
+            pygame.draw.circle(self._screen, (255, 255, 255),
+                              (ix - int(iris_r * 0.3), iy - int(iris_r * 0.3)), gleam_r)
             # Droopy eyebrow
             brow_y = cy - oh // 2 - 14
             tilt = 18 if is_left else -18
@@ -602,6 +644,10 @@ class FaceDisplay:
             pygame.draw.circle(self._screen, accent, (ix, iy), iris_r)
             pupil_r = int(iris_r * m_pupil)
             pygame.draw.circle(self._screen, pupil_color, (ix, iy), pupil_r)
+            # Gleam highlight
+            gleam_r = int(R * 0.07)
+            pygame.draw.circle(self._screen, (255, 255, 255),
+                              (ix - int(iris_r * 0.25), iy - int(iris_r * 0.25)), gleam_r)
             # Angry V-brow: \/ shape
             brow_y = cy - oh // 2 - 16
             inner_x = cx + (int(R * 0.5) if is_left else -int(R * 0.5))
@@ -611,7 +657,7 @@ class FaceDisplay:
                 accent, width=5
             )
             # Subtle vein lines (deterministic -- no per-frame random or SRCALPHA)
-            dim_vein = (max(0, accent[0] // 8), max(0, accent[1] // 8), max(0, accent[2] // 8))
+            dim_vein = (max(0, accent[0] // 3), max(0, accent[1] // 3), max(0, accent[2] // 3))
             for frac in [0.2, 0.5, 0.8]:
                 vx = cx - ow + int(ow * 2 * frac)
                 vy = cy - oh // 2 + int(oh * (0.3 if frac < 0.5 else 0.7))
@@ -658,6 +704,10 @@ class FaceDisplay:
             pygame.draw.circle(self._screen, accent, (ix, iy), iris_r)
             pupil_r = int(iris_r * m_pupil)
             pygame.draw.circle(self._screen, pupil_color, (ix, iy), pupil_r)
+            # Gleam highlight
+            gleam_r = int(R * 0.08)
+            pygame.draw.circle(self._screen, (255, 255, 255),
+                              (ix - int(iris_r * 0.3), iy - int(iris_r * 0.3)), gleam_r)
             # Worried eyebrows (tilted)
             brow_y = cy - big_r - 12
             tilt = -14 if is_left else 14
@@ -678,6 +728,10 @@ class FaceDisplay:
             pygame.draw.circle(self._screen, accent, (ix, iy), max(2, iris_r))
             pupil_r = int(iris_r * m_pupil)
             pygame.draw.circle(self._screen, pupil_color, (ix, iy), max(1, pupil_r))
+            # Gleam highlight
+            gleam_r = max(1, int(R * 0.06))
+            pygame.draw.circle(self._screen, (255, 255, 255),
+                              (ix - max(1, int(iris_r * 0.25)), iy - max(1, int(iris_r * 0.25))), gleam_r)
             if is_left:
                 self._draw_glow_line(
                     (cx - ow, cy - oh // 2 - 14 + 12),
@@ -868,11 +922,13 @@ class FaceDisplay:
                             (cx - open_w // 2, cy - mouth_open // 3, open_w, mouth_open)
                         )
             else:
+                # Idle fear: trembling wavy line (uses _idle_phase so it animates even when silent)
                 points = []
                 segments = 28
+                tremble_speed = self._idle_phase * 6.0  # Continuous trembling
                 for i in range(segments):
                     px = cx - wave_w + i * (2 * wave_w // max(segments - 1, 1))
-                    py = cy + math.sin(i * 0.85 + self._talk_phase * 2.5) * 7
+                    py = cy + math.sin(i * 0.85 + tremble_speed) * 7
                     points.append((int(px), int(py)))
                 if len(points) > 1:
                     dim_col = (max(0, color[0] // 5), max(0, color[1] // 5), max(0, color[2] // 5))

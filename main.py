@@ -153,7 +153,7 @@ class ECHO:
                     user_text = user_text[len(matched_phrase):].strip(" ,!.")
                     if not user_text:
                         # Just the wake word with nothing after — acknowledge and listen again
-                        self.speech.speak("Yes?", force_fallback=True)
+                        self.speech.speak("Yes?", emotion="neutral")
                         continue
 
                 logger.info(f"User said: '{user_text}'")
@@ -213,6 +213,9 @@ class ECHO:
                 elif command['type'] == 'stop':
                     self._handle_stop()
 
+                elif command['type'] == 'goodbye':
+                    self._handle_goodbye()
+
                 elif command['type'] == 'clear_history':
                     self._handle_clear_history()
 
@@ -251,7 +254,7 @@ class ECHO:
         }.get(direction, "Moving!")
         ack_thread = threading.Thread(
             target=self.speech.speak, args=(ack,),
-            kwargs={'force_fallback': True}, daemon=True,
+            kwargs={'emotion': 'neutral'}, daemon=True,
         )
         ack_thread.start()
 
@@ -260,7 +263,7 @@ class ECHO:
 
         if not success:
             # Speak on failure (obstacle blocked)
-            self.speech.speak("Obstacle ahead!", force_fallback=True)
+            self.speech.speak("Obstacle ahead!", emotion="surprise")
             self.face.set_emotion("surprise")
             time.sleep(0.5)
             self.face.set_emotion("neutral")
@@ -270,7 +273,7 @@ class ECHO:
         direction = command.get('direction', 'forward')
         logger.info(f"🔄 Starting continuous {direction} movement")
         self.face.set_emotion("neutral")
-        self.speech.speak(f"Moving {direction}. Say stop to halt.", force_fallback=True)
+        self.speech.speak(f"Moving {direction}. Say stop to halt.", emotion="neutral")
         self.nav.start_continuous_move(direction)
 
     def _handle_safe_move(self, command: dict):
@@ -278,7 +281,7 @@ class ECHO:
         direction = command.get('direction', 'forward')
         logger.info(f"🛡️ Safe move: {direction} with obstacle checking")
         self.face.set_emotion("neutral")
-        self.speech.speak(f"Moving carefully. I'll stop if I see an obstacle.", force_fallback=True)
+        self.speech.speak(f"Moving carefully. I'll stop if I see an obstacle.", emotion="neutral")
         # safe_forward now runs in background — non-blocking so robot stays responsive
         self.nav.safe_forward(duration=8.0)
 
@@ -286,7 +289,7 @@ class ECHO:
         """Handle patrol / back-and-forth movement."""
         logger.info("🔄 Starting patrol mode")
         self.face.set_emotion("happy")
-        self.speech.speak("Patrolling! Say stop when you want me to halt.", force_fallback=True)
+        self.speech.speak("Patrolling! Say stop when you want me to halt.", emotion="happy")
         self.nav.start_patrol()
 
     def _handle_follow(self):
@@ -300,23 +303,30 @@ class ECHO:
         self.nav.stop_continuous()  # Stop continuous/patrol modes too
         self.nav.emergency_stop()
         self.face.set_emotion("neutral")
-        self.speech.speak("Stopped!", force_fallback=True)
+        self.speech.speak("Stopped!", emotion="neutral")
+
+    def _handle_goodbye(self):
+        """Handle goodbye command — triggers graceful full shutdown."""
+        logger.info("👋 Goodbye command received — initiating shutdown")
+        self.nav.stop_continuous()
+        self.nav.emergency_stop()
+        self._running = False  # Breaks main loop → triggers shutdown() in start()
 
     def _handle_clear_history(self):
         """Handle clear conversation history command."""
         self.brain.clear_history()
         self.face.set_emotion("neutral")
-        self.speech.speak("Conversation cleared! Let's start fresh.", force_fallback=True)
+        self.speech.speak("Conversation cleared! Let's start fresh.", emotion="neutral")
         logger.info("Conversation history cleared by voice command")
 
     def _handle_look(self):
         """Handle 'what do you see' — sends camera frame to Gemini for scene description."""
         self.face.set_emotion("surprise")
-        self.speech.speak("Let me take a look!", force_fallback=True)
+        self.speech.speak("Let me take a look!", emotion="surprise")
 
         frame_jpeg = self.camera.get_frame_jpeg()
         if frame_jpeg is None:
-            self.speech.speak("I can't see anything right now. My camera might be off.", force_fallback=True)
+            self.speech.speak("I can't see anything right now. My camera might be off.", emotion="sad")
             self.face.set_emotion("sad")
             time.sleep(0.5)
             self.face.set_emotion("neutral")
@@ -333,7 +343,7 @@ class ECHO:
             self.speech.speak(description, emotion=response_emotion)
             self.face.set_talking(False)
         else:
-            self.speech.speak("I looked but I'm having trouble describing what I see.", force_fallback=True)
+            self.speech.speak("I looked but I'm having trouble describing what I see.", emotion="neutral")
 
         time.sleep(0.5)
         self.face.set_emotion("neutral")
@@ -345,9 +355,9 @@ class ECHO:
         new_vol = self.speech.adjust_volume(delta)
         pct = int(new_vol / 2.0 * 100)  # 2.0 is max → 100%
         if direction == 'up':
-            self.speech.speak(f"Volume up! Now at {pct} percent.", force_fallback=True)
+            self.speech.speak(f"Volume up! Now at {pct} percent.", emotion="neutral")
         else:
-            self.speech.speak(f"Volume down. Now at {pct} percent.", force_fallback=True)
+            self.speech.speak(f"Volume down. Now at {pct} percent.", emotion="neutral")
         logger.info(f"Volume adjusted {direction}: {new_vol:.2f}x ({pct}%)")
 
     def _handle_chat(self, user_text: str, emotion: str, confidence: float):
