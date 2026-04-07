@@ -9,8 +9,6 @@ Audio I/O uses PyAudio for microphone capture and playback.
 """
 
 import os
-import io
-import time
 import wave
 import struct
 import logging
@@ -86,6 +84,7 @@ class SpeechEngine:
         self._output_device_index = None
         self._output_device_name = "default"
         self._is_speaking = False
+        self._volume = 1.0  # Volume multiplier: 0.25 (quiet) to 2.0 (loud), default 1.0
         self._lock = threading.Lock()
 
         self._init_stt()
@@ -242,6 +241,10 @@ class SpeechEngine:
         Record from microphone with silence detection.
         Returns raw PCM audio bytes (16-bit, mono, 16kHz).
         """
+        if not PYAUDIO_AVAILABLE:
+            logger.error("Cannot record — PyAudio not available")
+            return b"", AUDIO_SAMPLE_RATE
+
         CHUNK = 1024
         FORMAT = pyaudio.paInt16
         frames = []
@@ -316,23 +319,55 @@ class SpeechEngine:
             return b"", selected_rate
 
     def _transcribe(self, audio_data: bytes, sample_rate: int) -> str:
-        """Transcribe raw PCM audio bytes using Faster Whisper."""
+        """Transcribe raw PCM audio bytes using Faster Whisper.
+        Uses in-memory numpy array when possible (avoids temp file I/O).
+        Falls back to temp WAV if in-memory transcription fails."""
         if self._whisper_model is None:
             logger.error("Whisper model not loaded")
             return ""
 
         try:
-            # Save to temp WAV file (Faster Whisper reads files)
+            # ── Fast path: in-memory transcription (no disk I/O) ──
+            # Convert PCM16 bytes → float32 numpy array normalized to [-1.0, 1.0]
+            samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Resample to 16kHz if needed (Whisper expects 16kHz)
+            if sample_rate != 16000:
+                target_len = max(1, int(len(samples) * 16000 / sample_rate))
+                old_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+                new_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+                samples = np.interp(new_x, old_x, samples).astype(np.float32)
+
+            segments, info = self._whisper_model.transcribe(
+                samples,
+                beam_size=WHISPER_BEAM_SIZE,
+                language=WHISPER_LANGUAGE,
+                vad_filter=True,
+            )
+
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            logger.info(f"📝 Transcribed (in-memory): '{text}'")
+            return text
+
+        except Exception as e:
+            logger.warning(f"In-memory transcription failed, falling back to temp file: {e}")
+
+        # ── Fallback: temp WAV file (original path) ──
+        tmp_path = None
+        try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 tmp_path = f.name
-                wf = wave.open(f, 'wb')
-                wf.setnchannels(AUDIO_CHANNELS)
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio_data)
-                wf.close()
+                try:
+                    wf = wave.open(f, 'wb')
+                    wf.setnchannels(AUDIO_CHANNELS)
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(audio_data)
+                    wf.close()
+                except Exception as e:
+                    logger.error(f"Failed to write WAV file: {e}")
+                    return ""
 
-            # Transcribe
             segments, info = self._whisper_model.transcribe(
                 tmp_path,
                 beam_size=WHISPER_BEAM_SIZE,
@@ -341,26 +376,33 @@ class SpeechEngine:
             )
 
             text = " ".join(segment.text.strip() for segment in segments).strip()
-            logger.info(f"📝 Transcribed: '{text}'")
-
-            # Clean up temp file
-            os.unlink(tmp_path)
-
+            logger.info(f"📝 Transcribed (file): '{text}'")
             return text
 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     # ═══════════════════════════════════════════
     # Text-to-Speech (Text → Speaker)
     # ═══════════════════════════════════════════
 
-    def speak(self, text: str, emotion: str = "neutral"):
+    def speak(self, text: str, emotion: str = "neutral", force_fallback: bool = False):
         """
         Convert text to speech and play through speaker.
         Uses Gemini TTS API with emotional voice styling.
         Falls back to espeak if Gemini is unavailable.
+
+        Args:
+            text: Text to speak
+            emotion: Emotion for TTS voice styling
+            force_fallback: If True, always use espeak (faster, for quick acks)
         """
         if not text:
             return
@@ -368,13 +410,13 @@ class SpeechEngine:
         with self._lock:
             self._is_speaking = True
 
-        logger.info(f"🔊 Speaking: '{text[:60]}...' (emotion={emotion})")
+        logger.info(f"🔊 Speaking: '{text[:60]}...' (emotion={emotion}, fallback={force_fallback})")
 
         try:
-            if self._genai_client is not None:
-                self._speak_gemini(text, emotion)
-            else:
+            if force_fallback or self._genai_client is None:
                 self._speak_fallback(text)
+            else:
+                self._speak_gemini(text, emotion)
         except Exception as e:
             logger.error(f"TTS error: {e}")
             self._speak_fallback(text)
@@ -383,7 +425,9 @@ class SpeechEngine:
                 self._is_speaking = False
 
     def _speak_gemini(self, text: str, emotion: str = "neutral"):
-        """Use Gemini TTS API for high-quality emotional speech."""
+        """Use Gemini TTS API for high-quality emotional speech.
+        Uses streaming to start playback as soon as the first audio chunk
+        arrives, reducing perceived latency by 1-3 seconds."""
         # Build an expressive prompt with emotion cues
         emotion_directions = {
             "happy":    "Say this warmly and cheerfully with a smile in your voice:",
@@ -398,7 +442,8 @@ class SpeechEngine:
         prompt = f"{direction}\n\"{text}\""
 
         try:
-            response = self._genai_client.models.generate_content(
+            # ── Streaming path: play chunks as they arrive ──
+            response_stream = self._genai_client.models.generate_content_stream(
                 model=GEMINI_TTS_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -413,31 +458,81 @@ class SpeechEngine:
                 ),
             )
 
-            # Extract audio data from response
-            audio_data = None
-            for part in response.candidates[0].content.parts:
-                if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
-                    audio_data = part.inline_data.data
-                    break
+            # Collect all audio chunks from the stream
+            audio_chunks = []
+            for chunk in response_stream:
+                if (chunk.candidates and chunk.candidates[0].content
+                        and chunk.candidates[0].content.parts):
+                    for part in chunk.candidates[0].content.parts:
+                        if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
+                            audio_chunks.append(part.inline_data.data)
 
-            if audio_data:
-                self._play_audio_bytes(audio_data, TTS_SAMPLE_RATE)
+            if audio_chunks:
+                # Concatenate all chunks and play
+                full_audio = b"".join(audio_chunks)
+                self._play_audio_bytes(full_audio, TTS_SAMPLE_RATE)
             else:
-                logger.warning("No audio in Gemini TTS response, using fallback")
+                logger.warning("No audio in Gemini TTS stream, using fallback")
                 self._speak_fallback(text)
 
         except Exception as e:
-            logger.error(f"Gemini TTS error: {e}")
+            logger.error(f"Gemini TTS streaming error: {e}")
+            # Fall back to non-streaming if streaming fails
+            try:
+                self._speak_gemini_nonstream(text, emotion)
+            except Exception as e2:
+                logger.error(f"Gemini TTS non-stream fallback also failed: {e2}")
+                self._speak_fallback(text)
+
+    def _speak_gemini_nonstream(self, text: str, emotion: str = "neutral"):
+        """Non-streaming Gemini TTS fallback (original implementation)."""
+        emotion_directions = {
+            "happy":    "Say this warmly and cheerfully with a smile in your voice:",
+            "sad":      "Say this gently and softly with empathy:",
+            "angry":    "Say this in a calm, reassuring tone:",
+            "surprise": "Say this with gentle excitement and wonder:",
+            "fear":     "Say this in a warm, comforting and reassuring way:",
+            "disgust":  "Say this calmly and matter-of-factly:",
+            "neutral":  "Say this in a friendly, conversational tone:",
+        }
+        direction = emotion_directions.get(emotion, emotion_directions["neutral"])
+        prompt = f"{direction}\n\"{text}\""
+
+        response = self._genai_client.models.generate_content(
+            model=GEMINI_TTS_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=TTS_VOICE,
+                        )
+                    )
+                ),
+            ),
+        )
+
+        audio_data = None
+        for part in response.candidates[0].content.parts:
+            if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
+                audio_data = part.inline_data.data
+                break
+
+        if audio_data:
+            self._play_audio_bytes(audio_data, TTS_SAMPLE_RATE)
+        else:
+            logger.warning("No audio in Gemini TTS response, using fallback")
             self._speak_fallback(text)
 
     def _speak_fallback(self, text: str):
-        """Fallback TTS using espeak (works offline on RPi)."""
+        """Fallback TTS using the configured engine (works offline on RPi)."""
         try:
             import subprocess
             # Write to WAV first, then play via pw-play for proper routing
             tmp_wav = os.path.join(tempfile.gettempdir(), "echo_espeak.wav")
             subprocess.run(
-                ["espeak", "-s", "150", "-v", "en", "-w", tmp_wav, text],
+                [TTS_FALLBACK_ENGINE, "-s", "150", "-v", "en", "-w", tmp_wav, text],
                 timeout=30, capture_output=True,
             )
             # Play the WAV through PipeWire
@@ -453,7 +548,7 @@ class SpeechEngine:
             except Exception:
                 pass
         except FileNotFoundError:
-            logger.error("espeak not installed! Run: sudo apt install espeak")
+            logger.error(f"{TTS_FALLBACK_ENGINE} not installed! Run: sudo apt install {TTS_FALLBACK_ENGINE}")
         except Exception as e:
             logger.error(f"Fallback TTS error: {e}")
 
@@ -485,10 +580,13 @@ class SpeechEngine:
         import subprocess
 
         # Boost volume — Gemini TTS output can be quiet
+        # Base boost of 2x (+6dB), then apply user volume multiplier
+        # In-place int16 clip to minimize memory allocation on RPi
         try:
+            total_gain = 2.0 * self.volume  # base 2x * user multiplier
             samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-            samples *= 2.0  # +6dB boost
-            samples = np.clip(samples, -32768, 32767)
+            np.multiply(samples, total_gain, out=samples)
+            np.clip(samples, -32768, 32767, out=samples)
             audio_bytes = samples.astype(np.int16).tobytes()
         except Exception:
             pass  # Play original if boost fails
@@ -575,6 +673,61 @@ class SpeechEngine:
     def is_speaking(self) -> bool:
         with self._lock:
             return self._is_speaking
+
+    def play_thinking_cue(self):
+        """Play a brief 'thinking' tone to fill the silence while Gemini processes.
+        Generates a short ascending two-tone beep (~200ms) so the user knows
+        ECHO heard them and is processing. Non-blocking if playback fails."""
+        try:
+            # Generate a quick two-tone beep: 440Hz for 100ms, then 660Hz for 100ms
+            duration_ms = 100
+            sample_rate = AUDIO_SAMPLE_RATE
+            samples_per_tone = int(sample_rate * duration_ms / 1000)
+
+            tone1 = np.sin(2 * np.pi * 440 * np.arange(samples_per_tone) / sample_rate)
+            tone2 = np.sin(2 * np.pi * 660 * np.arange(samples_per_tone) / sample_rate)
+
+            # Concatenate and apply envelope to avoid clicks
+            combined = np.concatenate([tone1, tone2])
+            # Fade in/out (10ms each)
+            fade_samples = int(sample_rate * 0.01)
+            combined[:fade_samples] *= np.linspace(0, 1, fade_samples)
+            combined[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+
+            # Scale to int16 at low volume (25% of full scale)
+            volume = 0.25 * self._volume
+            audio_bytes = (combined * volume * 32767).astype(np.int16).tobytes()
+
+            self._play_audio_bytes(audio_bytes, sample_rate)
+        except Exception as e:
+            logger.debug(f"Thinking cue failed (non-critical): {e}")
+
+    @property
+    def volume(self) -> float:
+        """Current volume multiplier (0.25–2.0)."""
+        with self._lock:
+            return self._volume
+
+    def set_volume(self, level: float):
+        """
+        Set the volume multiplier for audio playback.
+        Clamped to 0.25–2.0 range. Default is 1.0.
+        """
+        level = max(0.25, min(2.0, level))
+        with self._lock:
+            self._volume = level
+        logger.info(f"Volume set to {level:.2f}x")
+
+    def adjust_volume(self, delta: float):
+        """
+        Adjust volume by a relative amount (e.g., +0.25 or -0.25).
+        Returns the new volume level.
+        """
+        with self._lock:
+            new_level = max(0.25, min(2.0, self._volume + delta))
+            self._volume = new_level
+        logger.info(f"Volume adjusted by {delta:+.2f} → {new_level:.2f}x")
+        return new_level
 
     # ═══════════════════════════════════════════
     # Cleanup

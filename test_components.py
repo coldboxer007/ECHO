@@ -578,7 +578,8 @@ def test_display():
         import pygame
         from config import DISPLAY_WIDTH, DISPLAY_HEIGHT
 
-        pygame.init()
+        pygame.display.init()
+        pygame.font.init()
         info = pygame.display.Info()
         step(f"Detected display: {info.current_w}x{info.current_h}")
         step(f"Configured size:  {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
@@ -605,7 +606,8 @@ def test_display():
         step("Waiting 5 seconds...")
         time.sleep(5)
 
-        pygame.quit()
+        pygame.display.quit()
+        pygame.font.quit()
 
     except Exception as e:
         passed = False

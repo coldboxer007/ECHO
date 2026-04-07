@@ -116,20 +116,29 @@ The robot understands natural language, sees facial emotions via camera, respond
 
 ```
 User speaks → Mic captures audio (PyAudio @ 44100Hz)
-  → Silence detection stops recording
-  → Faster-Whisper tiny.en transcribes (beam_size=1, ~2-3s on RPi4)
+  → Silence detection stops recording (0.7s silence threshold)
+  → Faster-Whisper tiny.en transcribes (in-memory float32 array, no temp file)
+  → Wake word gate (optional — strips "Echo"/"Hey Echo" prefix, discards non-matching)
   → GeminiBrain.interpret_command() routes to handler:
+      ├─ If 'chat' → interpret_command_nlp() Gemini fallback for natural language
+      │   (e.g. "come ahead" → reclassified as move/forward)
       ├─ Movement → NavigationController → MotorController → GPIO → L298N → Motors
       ├─ Safe move → Continuous obstacle checking while moving
       ├─ Keep moving → Background thread, auto-pause on obstacle
       ├─ Patrol → Back-and-forth loop with obstacle awareness
       ├─ Stop → Emergency stop all motors
-      ├─ Follow → Camera face tracking + motor steering
-      └─ Chat → Gemini 2.5 Flash generates response
-               → determine_response_emotion() picks face emotion
-               → FaceDisplay shows emotion
-               → Gemini TTS generates speech audio
+      ├─ Follow → Camera face tracking + variable-speed motor steering
+      ├─ Look → Captures camera frame → Gemini vision analysis → speaks description
+      ├─ Volume → Adjusts TTS playback volume (louder/quieter)
+      ├─ Clear history → Resets conversation memory
+      └─ Chat → Gemini 2.5 Flash streams response sentence-by-sentence
+               → play_thinking_cue() (440Hz→660Hz beep, ~200ms)
+               → think_stream() yields sentences as they complete
+               → determine_response_emotion() picks face emotion from first sentence
+               → FaceDisplay shows emotion (shape-morphing transition)
+               → Gemini TTS streams each sentence (with volume control)
                → pw-play outputs through USB speaker
+  → Face gaze tracks detected face position (set_gaze from camera)
 ```
 
 ---
@@ -253,17 +262,18 @@ The L298N controls 6 motors organized as two groups of 3 (left side + right side
 ```
 ECHOtest/
 ├── main.py                  # Main entry point — the listen→think→speak→act loop
-├── debug_main.py            # Verbose debug version with color-coded terminal output
+├── debug_main.py            # Verbose debug mode (inherits from ECHO, color-coded output)
 ├── live_main.py             # Alternative: Gemini Live API bidirectional audio mode
-├── config.py                # ALL settings, pin assignments, model paths, prompts
-├── motor_controller.py      # L298N motor driver — forward/backward/turn/stop
-├── sensor_controller.py     # HC-SR04 ultrasonic + IR obstacle detection
-├── camera_sentiment.py      # USB webcam + TFLite facial emotion analysis
-├── speech_engine.py         # Faster-Whisper STT + Gemini TTS + audio I/O
-├── gemini_brain.py          # Gemini AI conversation + command interpretation
+├── config.py                # ALL settings, pin assignments, model paths, prompts, MOTOR_PWM_ENABLED
+├── motor_controller.py      # L298N motor driver — PWM/GPIO dual mode, watchdog, atexit safety
+├── sensor_controller.py     # HC-SR04 ultrasonic (median-filtered) + IR obstacle detection
+├── camera_sentiment.py      # USB webcam + TFLite facial emotion analysis (adaptive backoff, EMA)
+├── speech_engine.py         # Faster-Whisper STT (in-memory) + streaming Gemini TTS + thinking cue + volume
+├── gemini_brain.py          # Gemini AI conversation (streaming) + hybrid NLP command interpretation + vision
 ├── gemini_live.py           # Gemini Live API engine (bidirectional audio stream)
-├── face_display.py          # Pygame animated robot face (eyes, mouth, emotions)
-├── navigation.py            # High-level movement: manual, follow, patrol, safe move
+├── face_display.py          # Pygame animated robot face (morphing emotions, gaze tracking, reactions)
+├── navigation.py            # High-level movement: manual, follow (variable speed), patrol, safe move
+├── battery_monitor.py       # Battery voltage monitoring stub (ready for ADS1115 ADC hardware)
 ├── test_components.py       # Individual component test suite
 ├── setup.sh                 # System dependency installer
 ├── requirements.txt         # Python package requirements
@@ -286,14 +296,14 @@ The core of ECHO lives in `main.py` in the `ECHO._main_loop()` method. It runs c
 while running:
     1. Listen for voice input (SpeechEngine.listen())
     2. Get camera emotion (CameraSentiment.current_emotion)
-    3. Interpret command (GeminiBrain.interpret_command())
+    2b. Update face gaze from camera face position
+    3. Interpret command (local keywords → NLP fallback if 'chat')
     4. Route to handler based on command type
-    5. Execute action (move, speak, or both)
-    6. Update face display
-    7. Loop back to listening
+    5. Execute action (move, or streaming think→TTS for chat)
+    6. Loop back to listening
 ```
 
-The loop skips listening while the robot is speaking (to avoid hearing its own voice).
+The loop skips listening while the robot is speaking (to avoid hearing its own voice). For chat commands, the streaming pipeline plays a thinking cue, then speaks each sentence as it arrives from Gemini — reducing perceived latency by 1-3 seconds compared to waiting for the full response.
 
 ### Speech-to-Text Pipeline
 
@@ -301,9 +311,9 @@ The loop skips listening while the robot is speaking (to avoid hearing its own v
 
 1. **Microphone capture:** PyAudio opens the USB mic at its native sample rate (44100Hz for Zeb SoundMX through PipeWire). Records in 1024-sample chunks.
 
-2. **Silence detection:** Each chunk's RMS energy is computed. If RMS > 150 (configurable threshold), it's considered speech. Recording stops after 1.0 seconds of silence following speech, or after 5 seconds maximum.
+2. **Silence detection:** Each chunk's RMS energy is computed. If RMS > 150 (configurable threshold), it's considered speech. Recording stops after 0.7 seconds of silence following speech (reduced from 1.0s for snappier response), or after 5 seconds maximum.
 
-3. **Whisper transcription:** The recorded PCM audio is saved to a temporary WAV file and fed to Faster-Whisper with:
+3. **Whisper transcription:** The recorded PCM audio is converted to a float32 numpy array in memory and passed directly to Faster-Whisper (no temp WAV file I/O). If the source sample rate differs from 16kHz, it is resampled. Falls back to temp WAV file if in-memory transcription fails. Settings:
    - Model: `tiny.en` (39MB — chosen for speed on RPi4 CPU, ~2-3s per transcription)
    - Compute type: `int8` (quantized for ARM CPU)
    - Beam size: `1` (greedy decode — 10x faster than beam_size=3)
@@ -311,6 +321,8 @@ The loop skips listening while the robot is speaking (to avoid hearing its own v
    - Language: English only
 
 4. **ALSA error suppression:** Before importing PyAudio, we install a custom ALSA error handler using ctypes to suppress harmless "PCM plugin" warnings that interfere with PipeWire's ALSA compatibility layer.
+
+5. **Wake word gate (optional):** When `WAKE_WORD_ENABLED=True` in config, transcribed text must start with a wake phrase ("echo", "hey echo", "ok echo", "hi echo"). The wake phrase is stripped from the text before command interpretation. Non-matching speech is silently discarded. Implemented as a post-Whisper text filter rather than a pre-Whisper audio gate — Whisper already runs in ~2-3s, and adding a separate wake word model would increase latency and RAM usage on RPi 4B.
 
 **Performance evolution:**
 
@@ -322,30 +334,36 @@ The loop skips listening while the robot is speaking (to avoid hearing its own v
 
 ### AI Brain & Command Routing
 
-**File:** `gemini_brain.py` → `interpret_command()` + `think()`
+**File:** `gemini_brain.py` → `interpret_command()` + `think()` + `analyze_scene()`
 
-The brain has two functions:
+The brain has multiple functions:
 
-1. **Command interpretation** (`interpret_command`): Parses user text to determine if it's a movement command or conversation. Uses a **priority-based keyword matching system** (see [Command Routing](#command-routing--priority-system) below).
+1. **Command interpretation** (`interpret_command`): Parses user text to determine if it's a movement command, utility command, or conversation. Uses a **priority-based keyword matching system** (see [Command Routing](#command-routing--priority-system) below). Returns one of 10 command types: `move`, `keep_moving`, `safe_move`, `patrol`, `follow`, `stop`, `clear_history`, `look`, `volume`, `chat`.
 
-2. **Conversation** (`think`): Sends the user's text + detected emotion to Gemini 2.5 Flash with:
-   - System prompt defining ECHO's personality
-   - Conversation history (last 20 messages)
-   - Emotion tag from camera (e.g., `[EMOTION DETECTED: happy (75%)]`)
-   - Temperature: 0.8, max_output_tokens: 350, top_p: 0.9
+2. **Hybrid NLP fallback** (`interpret_command_nlp`): When local keyword matching returns `chat`, a Gemini API call classifies the phrase as a potential movement command. This catches natural language like "come ahead", "move closer", or "go that way" that local keywords miss. Only called as a fallback to avoid unnecessary API calls.
 
-3. **Emotion determination** (`determine_response_emotion`): Analyzes Gemini's response text for emotional keywords to choose the appropriate face animation.
+3. **Conversation — blocking** (`think`): Sends the user's text + detected emotion to Gemini 2.5 Flash and returns the complete response. Used as fallback when streaming is not needed.
+
+4. **Conversation — streaming** (`think_stream`): Generator that yields response sentences as they complete from Gemini. Uses `_SENTENCE_RE` regex to split on sentence boundaries (`.`, `!`, `?`). Enables the streaming think→TTS pipeline where the first sentence is spoken while subsequent ones are still generating.
+
+5. **Scene analysis** (`analyze_scene`): Sends a camera frame JPEG to Gemini vision for description. Triggered by "what do you see", "look around", etc.
+
+6. **Emotion determination** (`determine_response_emotion`): Analyzes Gemini's response text for emotional keywords to choose the appropriate face animation.
+
+7. **History management** (`clear_history`): Resets conversation memory on voice command.
 
 ### Text-to-Speech Pipeline
 
 **File:** `speech_engine.py` → `speak()` + `_speak_gemini()` + `_play_audio_bytes()`
 
-1. **Gemini TTS:** The response text is sent to `gemini-2.5-flash-preview-tts` with:
+1. **Gemini TTS (streaming):** The response text is sent to `gemini-2.5-flash-preview-tts` using `generate_content_stream()`. Audio chunks are collected as they arrive, concatenated, and played. Falls back to non-streaming if the stream fails. Settings:
    - Voice: "Kore" (firm, clear voice)
    - Emotion direction prepended (e.g., "Say this warmly and cheerfully with a smile in your voice:")
    - Output: raw PCM audio at 24kHz
 
-2. **Volume boost:** The returned audio gets a +6dB boost (x2.0 amplitude) because Gemini TTS output tends to be quiet.
+2. **Thinking audio cue:** Before streaming begins, `play_thinking_cue()` generates a brief ascending two-tone beep (440Hz → 660Hz, ~200ms) so the user knows ECHO heard them and is processing.
+
+3. **Volume boost + user volume:** The returned audio gets a base +6dB boost (x2.0 amplitude) because Gemini TTS output tends to be quiet. On top of this, a user-adjustable volume multiplier (0.25x – 2.0x) is applied. Volume can be adjusted by voice ("louder", "volume up", "quieter", "volume down") in 25% steps.
 
 3. **Playback:** Audio is written to a temp WAV file and played via:
    - **Primary:** `pw-play` (PipeWire native — most reliable on RPi with PipeWire)
@@ -362,22 +380,31 @@ The brain has two functions:
 
 **Motor Controller** (low-level):
 - Controls 4 GPIO pins connected to L298N motor driver
-- Each pin is set HIGH or LOW (no PWM yet — full speed only)
+- **Dual mode:** PWM speed control (software PWM @ 1000Hz) or simple GPIO on/off, controlled by `MOTOR_PWM_ENABLED` flag in config.py (defaults to `False` / GPIO mode)
+- In GPIO mode: pins are driven HIGH/LOW for full-speed on/off — simpler, works on all setups
+- In PWM mode: each pin uses `GPIO.PWM` with configurable duty cycle (default 80%) for variable speed
 - All 6 motors are in 2 groups: left (IN1/IN2) and right (IN3/IN4)
 - Differential drive: same direction = straight, opposite = turn in place
+- `set_speed()` is a no-op when PWM is disabled
+- **Watchdog thread:** Automatically stops motors after 30 seconds of continuous operation (safety)
+- **atexit handler:** Ensures motors stop on program exit, even on crashes
+- **Non-blocking timed moves:** Duration-based moves run in background threads, so the robot stays responsive to "stop" commands
 - GPIO pins initialized with `initial=GPIO.LOW` to prevent motor spin during setup
 - `GPIO.cleanup()` is **intentionally NOT called** — it resets pins to INPUT (floating/high-impedance), which the L298N reads as HIGH and spins the motors
 
 **Navigation Controller** (high-level):
 - Wraps motor controller with sensor feedback
 - Checks obstacles before forward movement
+- All flag reads/writes (`_follow_mode`, `_continuous_mode`, `_running`) are protected by a threading lock
+- `safe_forward` runs in a background thread (non-blocking)
 - Provides multiple movement modes (see [Movement Modes](#movement-modes))
+- **Follow mode** uses variable PWM speed: slow duty (45%) for fine adjustments, fast duty (80%) for approach
 
 ### Sensor Feedback & Obstacle Avoidance
 
 **File:** `sensor_controller.py`
 
-- **HC-SR04 ultrasonic:** Sends 10us trigger pulse, measures echo return time, calculates distance. Readings below 2cm are ignored as sensor noise.
+- **HC-SR04 ultrasonic:** Sends 10us trigger pulse, measures echo return time, calculates distance. Readings below 2cm are ignored as sensor noise. Uses **median filtering** (buffer of 3 readings) to debounce noisy readings.
 - **IR sensor:** Digital output (active-low). LOW = obstacle detected.
 - **Combined check:** `is_obstacle_ahead()` returns True if either sensor detects an obstacle within 12cm.
 - **Background monitoring:** Runs in a daemon thread at 5Hz (every 200ms), continuously updating sensor readings.
@@ -393,15 +420,23 @@ A full-screen pygame animation running at 20fps on the HDMI display:
 - **Two large eyes** positioned at 25% and 75% of screen width
 - **Centered mouth** at 78% of screen height
 - **7 emotions:** happy, sad, angry, surprise, fear, disgust, neutral — each with unique eye shapes, mouth curves, and color schemes
-- **Smooth transitions:** Emotion changes blend over ~0.33 seconds using linear interpolation
+- **Shape-morphing transitions:** Per-emotion geometry defined in `_EYE_PARAMS` and `_MOUTH_PARAMS` dicts, with smooth interpolation via `_emotion_blend` factor (~0.33 second morph)
+- **Emotion-specific eyebrows:** Neutral gets subtle flat lines, happy gets raised arcs, sad droops, angry slants inward, surprise lifts high, fear angles up, disgust furrows asymmetrically
+- **Camera-directed gaze tracking:** `set_gaze(x, y)` API accepts -1.0 to 1.0 coordinates from face detection. Overrides random pupil wander. Auto-expires after 3 seconds of no updates (resumes wander)
+- **Emotion-specific pupil behavior:** Fear pupils dart rapidly, sad droop downward, angry constrict toward center
+- **All emotion mouths animate during speech:** Sad mouth trembles, angry shows teeth bared, fear has wavy opening, disgust wiggles tongue, surprise pulses O shape
+- **Reaction animations:** Bounce (vertical displacement, 400ms decay) for surprise/fear/happy/neutral, shake (horizontal) for angry/disgust — triggered on emotion change
+- **Curved eyelid blinks:** Ellipse + arc edge for natural curved lid appearance (replaced rectangular blinks)
+- **Brighter blush:** For happy/surprise emotions — increased from (45,22,22) to (90,35,40) with larger 44x20 size
 - **Random blinking:** Every 2-5.5 seconds, eyes smoothly close and open (triangle wave)
-- **Pupil wandering:** Pupils drift randomly with lerp smoothing during idle
+- **Pupil wandering:** Pupils drift randomly with lerp smoothing during idle (overridden by gaze tracking when active)
 - **Breathing animation:** Subtle vertical oscillation of eye positions
 - **Talk animation:** Multi-frequency mouth movement (3 layered sine waves) when speaking
 - **Idle micro-movements:** Gentle sway when neutral
 
 **Performance optimizations:**
 - Scan line overlay pre-rendered once at startup (was creating new surface every frame)
+- Status font cached at init (was allocating a new `pygame.font.Font` every frame)
 - All glow effects use direct dim-color drawing instead of per-frame SRCALPHA surface allocations
 - Reduced from 30fps to 20fps (saves CPU for Whisper)
 - `pygame.display.init()` + `pygame.font.init()` instead of `pygame.init()` (avoids pygame stealing the audio device from PipeWire)
@@ -411,14 +446,16 @@ A full-screen pygame animation running at 20fps on the HDMI display:
 
 **File:** `camera_sentiment.py`
 
-1. **USB webcam** captures at 640x480 @ 15fps via OpenCV
-2. **Haar cascade** (`haarcascade_frontalface_default.xml`) detects faces in grayscale
+1. **USB webcam** captures at 640x480 @ 15fps via OpenCV (`CAP_PROP_BUFFERSIZE=1` for fresh frames)
+2. **Haar cascade** (`haarcascade_frontalface_default.xml`) detects faces in grayscale. Results are **cached per frame** to avoid running detection twice (once for sentiment, once for follow mode).
 3. **TFLite model** (`fer_3stage_fp16.tflite`) classifies facial emotion:
    - Input: 48x48 grayscale face crop
-   - Output: 7-class probability vector (angry, disgust, fear, happy, sad, surprise, neutral)
+   - Output: 7-class raw logits → softmax-normalized to probabilities (angry, disgust, fear, happy, sad, surprise, neutral)
    - Confidence threshold: 40%
-4. **Background loop** runs at 1Hz, updating `current_emotion` and `current_confidence`
-5. **Gemini API fallback** available if TFLite runtime is not installed
+   - **Emotion temporal smoothing** via exponential moving average (alpha=0.4) to reduce flickering
+4. **Adaptive backoff:** When no face is detected, analysis interval slows to 5x the normal rate to reduce CPU usage
+5. **Background loop** runs at 1Hz (with adaptive backoff), updating `current_emotion` and `current_confidence`
+6. **Gemini API fallback** available if TFLite runtime is not installed
 
 ---
 
@@ -448,10 +485,18 @@ Priority 4: Standard directional movement
     └── spin     → "spin", "turn around", "360"
 
 Priority 5: Follow mode
-    └── follow → "follow me", "come here"
+    └── follow → "follow me", "come here", "come with me"
 
-Priority 6: Chat (default)
-    └── Everything else → sent to Gemini for conversation
+Priority 6: Utility commands
+    ├── clear_history → "clear history", "forget everything", "start over"
+    ├── look          → "what do you see", "look around", "describe"
+    └── volume        → "louder", "volume up", "quieter", "volume down"
+
+Priority 7: Chat (default)
+    └─ Everything else → sent to Gemini for conversation
+        BUT FIRST: interpret_command_nlp() asks Gemini to classify
+        the phrase as a movement command (catches "come ahead",
+        "move closer", etc. that keywords miss)
 ```
 
 ---
@@ -460,12 +505,12 @@ Priority 6: Chat (default)
 
 | Mode | Trigger Phrase | Behavior |
 |---|---|---|
-| **Single move** | "move forward", "turn right" | Moves for default duration (1.0s move, 0.5s turn) |
-| **Timed move** | "go forward for 3 seconds" | Moves for specified duration |
+| **Single move** | "move forward", "turn right" | Moves for default duration (1.0s move, 0.5s turn) at configurable PWM speed |
+| **Timed move** | "go forward for 3 seconds" | Moves for specified duration (non-blocking — responds to stop commands) |
 | **Safe move** | "go forward carefully" | Moves with continuous obstacle checking, stops permanently on detection |
 | **Keep moving** | "keep going", "don't stop" | Continuous movement in background thread, auto-pauses on obstacle, resumes when clear |
 | **Patrol** | "patrol", "explore" | Forward 3s → pause → backward 3s → pause → repeat, with obstacle awareness |
-| **Follow** | "follow me" | Camera tracks largest face, steers toward it, maintains ~80cm distance |
+| **Follow** | "follow me" | Camera tracks largest face, variable-speed PWM steering (slow=45% for turns, fast=80% for approach), maintains ~80cm distance |
 | **Spin** | "spin", "turn around" | Right turn for 2 seconds |
 | **Emergency stop** | "stop", "halt", "freeze" | Immediately stops all motors and background movement modes |
 
@@ -485,7 +530,7 @@ The primary mode. Uses Faster-Whisper for local STT + Gemini for conversation + 
 ```bash
 python3 debug_main.py
 ```
-Same functionality but with verbose color-coded terminal output. Shows every sensor reading, command interpretation, and API call in real-time. Best for development.
+Same functionality as standard mode — `ECHODebug` inherits from the `ECHO` class and adds verbose, color-coded terminal output. Shows every sensor reading, command interpretation, API call, streaming sentence, gaze tracking, and timing breakdown in real-time. Best for development and troubleshooting. Overrides handler methods to add debug logging while delegating to the base class via `super()`. Includes the full streaming think→TTS pipeline, hybrid NLP fallback, and gaze tracking — all with debug output.
 
 ### Live API Mode (live_main.py)
 ```bash
@@ -528,7 +573,8 @@ sudo apt update && sudo apt install -y \
     alsa-utils espeak ffmpeg \
     libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev \
     libsdl2-mixer-dev python3-pygame \
-    v4l-utils pipewire pipewire-alsa
+    libatlas-base-dev libhdf5-dev \
+    v4l-utils pipewire pipewire-audio-client-libraries
 
 # Create and activate virtual environment
 python3 -m venv venv
@@ -816,44 +862,77 @@ On RPi4 CPU, beam search with beam_size=3 takes 24 seconds to transcribe 7 secon
 ### 8. Pre-rendered overlays for face display
 Originally, every frame allocated new pygame Surfaces with SRCALPHA for glow effects, scan lines, blush marks, etc. At 1024x768, each surface was 3.1MB. With dozens per frame at 30fps, this caused memory exhaustion and crashes after a few minutes. All effects now use either pre-rendered overlays (created once) or direct dim-color drawing.
 
+### 9. system_instruction for Gemini persona
+The system prompt is now passed via Gemini's `system_instruction` parameter rather than being prepended as a fake user/model message pair. This is the proper API usage — it saves tokens on every request and provides stronger persona adherence since the model treats it as a top-level instruction rather than conversation context.
+
+### 10. Debug mode via inheritance
+`debug_main.py` was refactored from 461 lines of ~80% duplicated code to 385 lines by having `ECHODebug` inherit from `ECHO`. All subsystem imports come through the base class. Override methods add debug output and call `super()` for the actual logic. This ensures bug fixes and new features in `main.py` automatically propagate to debug mode.
+
+### 11. Motor watchdog for safety
+A background watchdog thread monitors continuous motor operation and forces a stop after 30 seconds. Combined with `atexit.register()`, this prevents runaway motors if the program crashes, hangs, or the user forgets to stop. Non-blocking timed moves use background threads so the robot remains responsive to "stop" commands during movement.
+
+### 12. Emotion temporal smoothing
+Raw TFLite emotion predictions flicker rapidly between frames (e.g., happy → neutral → happy). An exponential moving average (alpha=0.4) smooths predictions over time, preventing jarring face animation changes while still responding quickly to genuine emotion shifts.
+
+### 13. Streaming think→TTS pipeline
+Instead of waiting for Gemini to generate the entire response before speaking, `think_stream()` yields sentences as they complete. The first sentence determines the response emotion and begins playing while subsequent sentences are still generating. This reduces perceived latency by 1-3 seconds on a typical 2-3 sentence response.
+
+### 14. Hybrid NLP command interpretation
+Pure keyword matching misses natural language movement phrases like "come ahead" or "move closer". Rather than sending every utterance to Gemini for classification (slow, wasteful), the hybrid approach tries fast local keywords first and only calls Gemini NLP when the result is `chat` — keeping the common case fast while catching ambiguous phrases.
+
+### 15. PWM made optional
+Some RPi setups have issues with software PWM (timing jitter, lgpio conflicts). The `MOTOR_PWM_ENABLED` flag allows falling back to simple GPIO on/off mode. All motor methods branch internally — `navigation.py` and callers don't need changes. `set_speed()` is a no-op in GPIO mode.
+
 ---
 
 ## Future Directions
 
 ### Planned Improvements
 
-1. **PWM Speed Control** — Currently motors are full-speed only (GPIO HIGH/LOW). Adding software PWM via `RPi.GPIO.PWM` or hardware PWM would enable variable speed, smoother turns, and gentler movements.
+1. ~~**PWM Speed Control**~~ — **DONE (Round 2), made optional (Round 3).** Software PWM (1000Hz) on all motor pins with configurable duty cycle. Follow mode uses variable speed based on face position. PWM can be disabled via `MOTOR_PWM_ENABLED = False` in config.py for setups that only need GPIO on/off control.
 
 2. **Gemini Live API as Primary Mode** — The `live_main.py` mode eliminates the separate Whisper → Gemini → TTS pipeline. With further testing, it could become the default, cutting latency from ~5-8s to under 2s for a full conversation turn.
 
-3. **Wake Word Detection** — Add a lightweight wake word detector (e.g., Porcupine, openWakeWord) so ECHO only activates on "Hey Echo" instead of listening continuously.
+3. ~~**Wake Word Detection**~~ — **DONE.** Post-Whisper text filter checks for "Echo"/"Hey Echo" prefix. Configurable via `WAKE_WORD_ENABLED` in config.py (off by default for minimal-friction interaction).
 
 4. **SLAM / Mapping** — Use ultrasonic + camera data to build a rudimentary room map for autonomous navigation beyond simple obstacle avoidance.
 
 5. **Multi-Person Tracking** — Extend the follow mode to track specific people using face embeddings, rather than just following the largest face.
 
-6. **Gemini Robotics-ER Integration** — The codebase already has `analyze_scene()` and `detect_person_position()` methods using Gemini Robotics-ER for richer scene understanding. These could power smarter navigation.
+6. ~~**Camera Vision**~~ — **DONE.** "What do you see?" / "Look around" sends camera frame to Gemini vision for scene description. Also used for Gemini-based emotion fallback when TFLite is unavailable.
 
 7. **Edge TPU / Coral Accelerator** — Adding a Google Coral USB accelerator would speed up TFLite inference from ~100ms to ~10ms and enable real-time emotion detection at camera framerate.
 
-8. **Battery Monitoring** — Add an ADC (e.g., ADS1115) to monitor motor battery voltage and have ECHO warn when batteries are low.
+8. ~~**Battery Monitoring**~~ — **STUB READY.** `battery_monitor.py` module created with `BatteryMonitor` class, simulated voltage readings, low/critical thresholds, background check loop. Ready for ADS1115 ADC hardware integration.
 
-9. **OTA Updates** — Implement a simple git-pull mechanism so the robot can update its own code over WiFi.
+9. ~~**Volume Control**~~ — **DONE.** Voice-adjustable TTS volume ("louder", "quieter", "volume up/down") with 0.25x–2.0x range in 25% steps.
 
-10. **Web Dashboard** — A Flask/FastAPI web interface showing real-time sensor data, camera feed, conversation history, and manual controls accessible from any device on the local network.
+10. **OTA Updates** — Implement a simple git-pull mechanism so the robot can update its own code over WiFi.
 
-11. **Persistent Memory** — Save conversation highlights and user preferences to a local SQLite database so ECHO remembers across restarts.
+11. **Web Dashboard** — A Flask/FastAPI web interface showing real-time sensor data, camera feed, conversation history, and manual controls accessible from any device on the local network.
 
-12. **Sound Localization** — With a stereo mic array, ECHO could turn toward the person speaking before responding.
+12. **Persistent Memory** — Save conversation highlights and user preferences to a local SQLite database so ECHO remembers across restarts.
+
+13. **Sound Localization** — With a stereo mic array, ECHO could turn toward the person speaking before responding.
+
+14. ~~**Streaming Think→TTS Pipeline**~~ — **DONE (Round 3).** `think_stream()` yields sentences as they complete from Gemini. Each sentence is spoken immediately while the next generates, reducing perceived latency by 1-3 seconds.
+
+15. ~~**In-Memory Whisper Transcription**~~ — **DONE (Round 3).** PCM audio is converted to float32 numpy array and passed directly to Faster-Whisper, eliminating temp WAV file I/O.
+
+16. ~~**Thinking Audio Cue**~~ — **DONE (Round 3).** Brief ascending two-tone beep (440Hz→660Hz, ~200ms) plays before Gemini starts generating, so the user knows ECHO heard them.
+
+17. ~~**Natural Language Command Understanding**~~ — **DONE (Round 3).** Hybrid NLP: fast local keyword match first, Gemini API fallback for ambiguous natural language phrases like "come ahead" or "move closer".
+
+18. ~~**Face Display Overhaul**~~ — **DONE (Round 3).** Shape-morphing transitions, emotion-specific eyebrows, camera-directed gaze tracking, all-emotion talking mouths, pupil behaviors, brighter blush, reaction animations (bounce/shake), and curved eyelid blinks.
 
 ### Known Limitations
 
-- **No PWM speed control** — motors are either full speed or stopped
 - **Single-language** — English only (Whisper tiny.en)
-- **No wake word** — listens continuously, uses silence detection
-- **TFLite runtime optional** — sentiment defaults to "neutral" without it
+- **TFLite runtime optional** — sentiment defaults to "neutral" without it; model output is softmax-normalized for correct probability interpretation
 - **WiFi dependent** — Gemini API requires internet connectivity
 - **5V/3.3V mismatch** — HC-SR04 ECHO pin needs a voltage divider
+- **No rear sensors** — backward movement logs a warning but cannot detect obstacles behind the robot
+- **Battery monitoring hardware** — `battery_monitor.py` exists as a stub; requires ADS1115 ADC for actual voltage readings
 
 ---
 

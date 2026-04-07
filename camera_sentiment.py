@@ -32,7 +32,11 @@ except ImportError:
         logger.info("Using tensorflow.lite")
     except ImportError:
         TFLITE_AVAILABLE = False
-        logger.warning("No TFLite runtime available — sentiment will be 'neutral'")
+        logger.warning(
+            "No TFLite runtime available — sentiment will always be 'neutral'. "
+            "Install with: pip install tflite-runtime  (or for RPi: "
+            "pip install --index-url https://google-coral.github.io/py-repo/ tflite_runtime)"
+        )
 
 from config import (
     CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS,
@@ -56,6 +60,19 @@ class CameraSentiment:
         self._running = False
         self._lock = threading.Lock()
 
+        # Cached face detection results (avoid running Haar cascade twice per cycle)
+        self._cached_faces = []
+        self._cached_faces_frame_id = -1
+        self._frame_counter = 0
+
+        # Sentiment backoff: skip analysis when no face seen for a while
+        self._no_face_streak = 0
+        self._backoff_interval = SENTIMENT_INTERVAL  # Current interval (grows with backoff)
+
+        # Emotion temporal smoothing: EMA (exponential moving average)
+        self._emotion_scores = {label: 0.0 for label in SENTIMENT_LABELS}
+        self._ema_alpha = 0.4  # Blending factor: 0=all history, 1=only latest
+
         self._init_camera()
         self._init_model()
         self._init_face_detector()
@@ -68,6 +85,8 @@ class CameraSentiment:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
             self._cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            # Minimize buffer to get fresh frames (reduces 200-300ms lag in follow mode)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             logger.info(f"Camera opened: index={CAMERA_INDEX}")
         else:
             logger.error("Failed to open USB camera!")
@@ -111,8 +130,10 @@ class CameraSentiment:
         if not ret:
             return None
 
+        self._frame_counter += 1
         with self._lock:
-            self._current_frame = frame.copy()
+            # Store reference directly — only copy when get_current_frame() is called
+            self._current_frame = frame
 
         return frame
 
@@ -122,9 +143,15 @@ class CameraSentiment:
             return self._current_frame.copy() if self._current_frame is not None else None
 
     def detect_faces(self, frame: np.ndarray) -> list:
-        """Detect faces in frame. Returns list of (x, y, w, h) rectangles."""
+        """Detect faces in frame. Returns list of (x, y, w, h) rectangles.
+        Results are cached per frame to avoid running Haar cascade twice
+        (once for sentiment, once for follow mode)."""
         if self._face_cascade is None or frame is None:
             return []
+
+        # Return cached result if same frame
+        if self._frame_counter == self._cached_faces_frame_id:
+            return self._cached_faces
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self._face_cascade.detectMultiScale(
@@ -133,7 +160,13 @@ class CameraSentiment:
             minNeighbors=5,
             minSize=(48, 48),
         )
-        return list(faces)
+        result = list(faces)
+
+        # Cache for this frame
+        self._cached_faces = result
+        self._cached_faces_frame_id = self._frame_counter
+
+        return result
 
     def analyze_sentiment(self, frame: np.ndarray = None) -> tuple:
         """
@@ -185,13 +218,37 @@ class CameraSentiment:
             self._interpreter.invoke()
             output = self._interpreter.get_tensor(self._output_details[0]['index'])
 
-            # Parse output
-            probabilities = output[0]
-            max_idx = np.argmax(probabilities)
-            confidence = float(probabilities[max_idx])
+            # Parse output — apply softmax to convert raw logits to probabilities
+            raw = output[0].astype(np.float64)
+            # Numerical-stable softmax
+            shifted = raw - np.max(raw)
+            exp_vals = np.exp(shifted)
+            probabilities = exp_vals / np.sum(exp_vals)
 
-            if max_idx < len(SENTIMENT_LABELS) and confidence >= SENTIMENT_CONFIDENCE_THRESHOLD:
-                emotion = SENTIMENT_LABELS[max_idx]
+            # Temporal smoothing via EMA — reduces emotion flicker from noisy frames
+            for i, label in enumerate(SENTIMENT_LABELS):
+                if i < len(probabilities):
+                    self._emotion_scores[label] = (
+                        self._ema_alpha * float(probabilities[i]) +
+                        (1 - self._ema_alpha) * self._emotion_scores[label]
+                    )
+
+            # Pick emotion from smoothed scores
+            smoothed_emotion = max(self._emotion_scores, key=self._emotion_scores.get)
+            smoothed_confidence = self._emotion_scores[smoothed_emotion]
+
+            max_idx = int(np.argmax(probabilities))
+            confidence = float(probabilities[max_idx])
+            logger.debug(
+                f"Sentiment raw logits: {raw.tolist()}, "
+                f"softmax: {probabilities.tolist()}, "
+                f"best: idx={max_idx} conf={confidence:.3f}, "
+                f"smoothed: {smoothed_emotion} ({smoothed_confidence:.3f})"
+            )
+
+            if smoothed_confidence >= SENTIMENT_CONFIDENCE_THRESHOLD:
+                emotion = smoothed_emotion
+                confidence = smoothed_confidence
             else:
                 emotion = "neutral"
                 confidence = 0.0
@@ -265,7 +322,9 @@ class CameraSentiment:
         logger.info("Sentiment analysis stopped")
 
     def _analysis_loop(self):
-        """Continuously capture and analyze sentiment."""
+        """Continuously capture and analyze sentiment.
+        Uses adaptive backoff: slows down when no face is visible,
+        speeds back up when a face appears."""
         while self._running:
             try:
                 frame = self.capture_frame()
@@ -273,9 +332,20 @@ class CameraSentiment:
                     emotion, conf = self.analyze_sentiment(frame)
                     if conf > 0:
                         logger.debug(f"Emotion: {emotion} ({conf:.2f})")
+                        # Face found — reset backoff
+                        self._no_face_streak = 0
+                        self._backoff_interval = SENTIMENT_INTERVAL
+                    else:
+                        # No face — increase backoff (up to 5x the base interval)
+                        self._no_face_streak += 1
+                        if self._no_face_streak > 5:
+                            self._backoff_interval = min(
+                                SENTIMENT_INTERVAL * 5.0,
+                                self._backoff_interval * 1.5
+                            )
             except Exception as e:
                 logger.error(f"Analysis loop error: {e}")
-            time.sleep(SENTIMENT_INTERVAL)
+            time.sleep(self._backoff_interval)
 
     # ── Cleanup ──
 

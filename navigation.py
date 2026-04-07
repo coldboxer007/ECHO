@@ -12,16 +12,15 @@ Modes:
 import time
 import logging
 import threading
-import cv2
 
 logger = logging.getLogger("echo.navigation")
 
 from config import (
     MOTOR_MOVE_DURATION, MOTOR_TURN_DURATION,
-    OBSTACLE_DISTANCE_CM,
     FOLLOW_TARGET_DISTANCE_CM, FOLLOW_TURN_THRESHOLD_PX,
     FOLLOW_LOST_TIMEOUT,
     CAMERA_WIDTH,
+    MOTOR_FOLLOW_SLOW_DUTY, MOTOR_FOLLOW_FAST_DUTY,
 )
 
 
@@ -75,6 +74,8 @@ class NavigationController:
         if direction == 'forward':
             self.motors.forward(duration or MOTOR_MOVE_DURATION)
         elif direction == 'backward':
+            # Note: sensors face forward only — log a warning
+            logger.warning("Moving backward — no rear obstacle sensors available")
             self.motors.backward(duration or MOTOR_MOVE_DURATION)
         elif direction == 'left':
             self.motors.turn_left(duration or MOTOR_TURN_DURATION)
@@ -88,7 +89,10 @@ class NavigationController:
 
     def emergency_stop(self):
         """Immediately stop everything."""
-        self._follow_mode = False
+        with self._lock:
+            self._follow_mode = False
+            self._continuous_mode = False
+            self._running = False
         self.motors.stop()
         logger.warning("⛔ Emergency stop!")
 
@@ -135,7 +139,10 @@ class NavigationController:
         lost_timer = 0.0
         last_time = time.time()
 
-        while self._running and self._follow_mode:
+        while True:
+            with self._lock:
+                if not self._running or not self._follow_mode:
+                    break
             now = time.time()
             dt = now - last_time
             last_time = now
@@ -175,22 +182,28 @@ class NavigationController:
 
             # Steering
             if abs(offset_x) > FOLLOW_TURN_THRESHOLD_PX:
+                # Scale turn speed by how far off-center the face is
+                turn_speed = int(MOTOR_FOLLOW_SLOW_DUTY + (
+                    MOTOR_FOLLOW_FAST_DUTY - MOTOR_FOLLOW_SLOW_DUTY
+                ) * min(1.0, abs(offset_x) / (frame_center_x * 0.8)))
                 if offset_x > 0:
                     # Person is to the right
-                    self.motors.slight_right()
+                    self.motors.slight_right(speed=turn_speed)
                 else:
                     # Person is to the left
-                    self.motors.slight_left()
+                    self.motors.slight_left(speed=turn_speed)
             else:
                 # Person is roughly centered — check distance
                 distance = self.sensors.read_distance()
 
                 if distance > FOLLOW_TARGET_DISTANCE_CM:
-                    # Too far — move forward
-                    self.motors.forward()
+                    # Too far — move forward, speed proportional to distance
+                    ratio = min(1.0, (distance - FOLLOW_TARGET_DISTANCE_CM) / FOLLOW_TARGET_DISTANCE_CM)
+                    speed = int(MOTOR_FOLLOW_SLOW_DUTY + ratio * (MOTOR_FOLLOW_FAST_DUTY - MOTOR_FOLLOW_SLOW_DUTY))
+                    self.motors.forward(speed=speed)
                 elif distance < FOLLOW_TARGET_DISTANCE_CM * 0.6:
-                    # Too close — back up slightly
-                    self.motors.backward()
+                    # Too close — back up gently
+                    self.motors.backward(speed=MOTOR_FOLLOW_SLOW_DUTY)
                 else:
                     # Good distance — stop
                     self.motors.stop()
@@ -207,25 +220,46 @@ class NavigationController:
         """
         Move forward while continuously checking for obstacles.
         Stops immediately if obstacle detected.
+        Runs in background — non-blocking so voice commands are still heard.
+        Returns immediately; use stop_continuous() to cancel.
         """
         if self._follow_mode:
             self.stop_follow()
-        self._continuous_mode = True
+
+        self.stop_continuous()
+        with self._lock:
+            self._continuous_mode = True
+
+        self._continuous_thread = threading.Thread(
+            target=self._safe_forward_loop,
+            args=(duration, check_interval),
+            daemon=True,
+        )
+        self._continuous_thread.start()
+        logger.info(f"🛡️ Safe forward started (max {duration}s)")
+
+    def _safe_forward_loop(self, duration: float, check_interval: float):
+        """Background loop for safe_forward with obstacle checking."""
         self.motors.forward()
         elapsed = 0.0
 
-        while elapsed < duration and self._continuous_mode:
+        while elapsed < duration:
+            with self._lock:
+                if not self._continuous_mode:
+                    break
             if self.sensors.is_obstacle_ahead():
                 self.motors.stop()
                 logger.warning("⚠️ Obstacle detected! Stopped safely.")
-                self._continuous_mode = False
-                return False
+                with self._lock:
+                    self._continuous_mode = False
+                return
             time.sleep(check_interval)
             elapsed += check_interval
 
         self.motors.stop()
-        self._continuous_mode = False
-        return True
+        with self._lock:
+            self._continuous_mode = False
+        logger.info("✅ Safe forward completed")
 
     # ═══════════════════════════════════════════
     # Continuous Movement (keep going until stop)
@@ -240,7 +274,8 @@ class NavigationController:
         if self._follow_mode:
             self.stop_follow()
 
-        self._continuous_mode = True
+        with self._lock:
+            self._continuous_mode = True
         self._continuous_thread = threading.Thread(
             target=self._continuous_loop, args=(direction,), daemon=True
         )
@@ -249,14 +284,17 @@ class NavigationController:
 
     def stop_continuous(self):
         """Stop continuous movement."""
-        if self._continuous_mode:
+        with self._lock:
+            was_running = self._continuous_mode
             self._continuous_mode = False
+        if was_running:
             self.motors.stop()
             logger.info("🛑 Continuous movement STOPPED")
 
     @property
     def is_continuous(self) -> bool:
-        return self._continuous_mode
+        with self._lock:
+            return self._continuous_mode
 
     def _continuous_loop(self, direction: str):
         """Background loop for continuous movement with obstacle checking."""
@@ -267,17 +305,26 @@ class NavigationController:
 
         move_fn()  # Start moving (no duration = continuous)
 
-        while self._continuous_mode:
+        while True:
+            with self._lock:
+                if not self._continuous_mode:
+                    break
             # Check obstacles for forward movement
             if direction == 'forward' and self.sensors.is_obstacle_ahead():
                 self.motors.stop()
                 logger.warning("⚠️ Obstacle! Pausing continuous movement...")
                 # Wait until obstacle clears
-                while self._continuous_mode and self.sensors.is_obstacle_ahead():
+                while True:
+                    with self._lock:
+                        if not self._continuous_mode:
+                            break
+                    if not self.sensors.is_obstacle_ahead():
+                        break
                     time.sleep(0.2)
-                if self._continuous_mode:
-                    logger.info("✅ Obstacle cleared, resuming movement")
-                    move_fn()
+                with self._lock:
+                    if self._continuous_mode:
+                        logger.info("✅ Obstacle cleared, resuming movement")
+                        move_fn()
             time.sleep(0.1)
 
         self.motors.stop()
@@ -295,7 +342,8 @@ class NavigationController:
         if self._follow_mode:
             self.stop_follow()
 
-        self._continuous_mode = True
+        with self._lock:
+            self._continuous_mode = True
         self._continuous_thread = threading.Thread(
             target=self._patrol_loop, args=(forward_duration, pause), daemon=True
         )
@@ -304,12 +352,19 @@ class NavigationController:
 
     def _patrol_loop(self, fwd_dur: float, pause: float):
         """Background loop for patrol movement."""
-        while self._continuous_mode:
+        while True:
+            with self._lock:
+                if not self._continuous_mode:
+                    break
+
             # Forward leg
             logger.info("🔄 Patrol: moving forward")
             self.motors.forward()
             elapsed = 0.0
-            while elapsed < fwd_dur and self._continuous_mode:
+            while elapsed < fwd_dur:
+                with self._lock:
+                    if not self._continuous_mode:
+                        break
                 if self.sensors.is_obstacle_ahead():
                     self.motors.stop()
                     logger.warning("⚠️ Patrol: obstacle during forward, reversing early")
@@ -318,31 +373,38 @@ class NavigationController:
                 elapsed += 0.1
             self.motors.stop()
 
-            if not self._continuous_mode:
-                break
+            with self._lock:
+                if not self._continuous_mode:
+                    break
 
             # Pause
             time.sleep(pause)
-            if not self._continuous_mode:
-                break
+            with self._lock:
+                if not self._continuous_mode:
+                    break
 
             # Backward leg
             logger.info("🔄 Patrol: moving backward")
             self.motors.backward()
             elapsed = 0.0
-            while elapsed < fwd_dur and self._continuous_mode:
+            while elapsed < fwd_dur:
+                with self._lock:
+                    if not self._continuous_mode:
+                        break
                 time.sleep(0.1)
                 elapsed += 0.1
             self.motors.stop()
 
-            if not self._continuous_mode:
-                break
+            with self._lock:
+                if not self._continuous_mode:
+                    break
 
             # Pause
             time.sleep(pause)
 
         self.motors.stop()
-        self._continuous_mode = False
+        with self._lock:
+            self._continuous_mode = False
 
     # ═══════════════════════════════════════════
     # Cleanup

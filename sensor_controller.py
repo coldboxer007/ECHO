@@ -35,6 +35,9 @@ class SensorController:
         self._ir_blocked = False
         self._running = False
         self._lock = threading.Lock()
+        # Ultrasonic averaging buffer (median of last N readings)
+        self._distance_history = []
+        self._distance_history_size = 3  # Median of 3 readings
         self._setup_gpio()
         logger.info("SensorController initialized")
 
@@ -116,9 +119,16 @@ class SensorController:
             return False
 
     def is_obstacle_ahead(self) -> bool:
-        """Check if there's an obstacle using both sensors."""
-        distance = self.read_distance()
+        """Check if there's an obstacle using both sensors.
+        Uses median of recent ultrasonic readings to debounce noisy data."""
+        raw_distance = self.read_distance()
         ir_blocked = self.read_ir()
+
+        # Median filtering on ultrasonic readings to reduce noise
+        self._distance_history.append(raw_distance)
+        if len(self._distance_history) > self._distance_history_size:
+            self._distance_history.pop(0)
+        distance = sorted(self._distance_history)[len(self._distance_history) // 2]
 
         with self._lock:
             self._distance = distance
@@ -132,7 +142,7 @@ class SensorController:
 
         if obstacle:
             logger.debug(
-                f"Obstacle detected! Distance: {distance}cm, IR: {ir_blocked}"
+                f"Obstacle detected! Distance: {distance}cm (raw: {raw_distance}cm), IR: {ir_blocked}"
             )
 
         return obstacle

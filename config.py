@@ -28,12 +28,20 @@ MOTOR_IN1 = 31  # Left motors forward   (GPIO 6)
 MOTOR_IN2 = 33  # Left motors backward  (GPIO 13)
 MOTOR_IN3 = 35  # Right motors forward  (GPIO 19)
 MOTOR_IN4 = 37  # Right motors backward (GPIO 26)
-MOTOR_GND = 39  # Ground
+# Note: GND (pin 39) is a physical ground connection — not software-controlled.
 
 # Motor speed/timing
-MOTOR_DEFAULT_SPEED = 1.0   # 0.0 to 1.0 (no PWM yet, so this is on/off)
 MOTOR_TURN_DURATION = 0.5   # seconds for a quick turn
 MOTOR_MOVE_DURATION = 1.0   # seconds for default move command
+
+# PWM speed control (software PWM on IN pins — no ENA/ENB hardware wiring needed)
+# Set MOTOR_PWM_ENABLED = False to use simple GPIO HIGH/LOW (full-speed only).
+# This is useful when EN jumpers are in place and PWM causes motor whine/issues.
+MOTOR_PWM_ENABLED = False   # True = variable speed via PWM; False = simple on/off
+MOTOR_PWM_FREQ = 1000       # Hz — 1kHz is quiet and smooth for DC motors
+MOTOR_DEFAULT_DUTY = 80     # Default duty cycle % (0-100).  80% avoids brown-out on weak batteries.
+MOTOR_FOLLOW_SLOW_DUTY = 45 # Duty cycle when close to follow target (gentle approach)
+MOTOR_FOLLOW_FAST_DUTY = 80 # Duty cycle when far from follow target
 
 # ─────────────────────────────────────────────
 # Ultrasonic Sensor (HC-SR04)
@@ -79,7 +87,12 @@ AUDIO_SAMPLE_RATE = 16000  # 16kHz for Whisper
 AUDIO_CHANNELS = 1
 AUDIO_CHUNK_DURATION = 5   # Max seconds per voice command recording (was 8, too long)
 AUDIO_SILENCE_THRESHOLD = 150  # RMS threshold for silence detection (tuned for Zeb SoundMX USB mic)
-AUDIO_SILENCE_DURATION = 1.0   # Seconds of silence before stopping recording (was 1.5)
+AUDIO_SILENCE_DURATION = 0.7   # Seconds of silence before stopping recording (was 1.0)
+
+# Wake word gate: when enabled, only process speech that starts with a wake phrase.
+# Set to False for always-listening mode (original behavior).
+WAKE_WORD_ENABLED = False
+WAKE_WORD_PHRASES = ["echo", "hey echo", "ok echo", "hi echo"]
 
 # ─────────────────────────────────────────────
 # Text-to-Speech (Gemini TTS)
@@ -94,7 +107,7 @@ TTS_FALLBACK_ENGINE = "espeak"  # Fallback if Gemini TTS fails
 # Force audio through 3.5mm jack (not HDMI)
 # Set on Pi with: sudo raspi-config → System Options → Audio → Headphones
 # Or: amixer cset numid=3 1
-AUDIO_OUTPUT = "headphones"  # "headphones" = 3.5mm jack, "hdmi" = HDMI audio
+# Note: Audio routing is handled by PipeWire/ALSA — no software config needed here.
 
 # ─────────────────────────────────────────────
 # Face Display (5" HDMI capacitive touch, 800x480)
@@ -118,7 +131,6 @@ EMOTION_COLORS = {
 # ─────────────────────────────────────────────
 # Navigation / Follow Mode
 # ─────────────────────────────────────────────
-FOLLOW_MODE_ENABLED = False       # Toggled by voice command
 FOLLOW_TARGET_DISTANCE_CM = 80    # Try to maintain this distance
 FOLLOW_TURN_THRESHOLD_PX = 50    # Pixel offset from center to trigger turn
 FOLLOW_LOST_TIMEOUT = 3.0         # Seconds before stopping if person lost

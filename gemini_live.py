@@ -42,7 +42,12 @@ try:
 except Exception:
     pass
 
-import pyaudio
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
+    logger.error("pyaudio not available! Install with: pip install pyaudio")
 
 try:
     from google import genai
@@ -66,7 +71,7 @@ from config import (
 # ─────────────────────────────────────────────
 # Audio Configuration
 # ─────────────────────────────────────────────
-FORMAT = pyaudio.paInt16
+FORMAT = pyaudio.paInt16 if PYAUDIO_AVAILABLE else None
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000     # Mic → Gemini
 RECEIVE_SAMPLE_RATE = 24000  # Gemini → Speaker
@@ -140,6 +145,10 @@ class GeminiLiveEngine:
 
     def start(self):
         """Start the live audio session in a background thread."""
+        if not PYAUDIO_AVAILABLE:
+            logger.error("Cannot start — pyaudio is not installed")
+            return
+
         if self._running:
             logger.warning("Already running")
             return

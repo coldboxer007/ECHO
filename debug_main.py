@@ -5,6 +5,10 @@ ECHO — Debug Main (Verbose Terminal Output)
 Same interaction loop as main.py but prints ALL inputs, outputs,
 sensor data, and system state to the terminal for debugging.
 
+ECHODebug inherits from ECHO (main.py) and overrides handlers to add
+verbose color-coded terminal output. All core logic lives in the base
+class — this file only adds debug printing and stats tracking.
+
 Run:
     python3 debug_main.py
 
@@ -12,9 +16,7 @@ Everything the robot hears, thinks, says, and senses is printed
 with timestamps and color-coded tags.
 """
 
-import sys
 import time
-import signal
 import logging
 import threading
 import traceback
@@ -32,15 +34,9 @@ for noisy in ["httpx", "urllib3", "google_genai", "faster_whisper", "httpcore"]:
 
 logger = logging.getLogger("echo.debug")
 
-# ─── Import Subsystems ───
-from config import FOLLOW_MODE_ENABLED
-from motor_controller import MotorController
-from sensor_controller import SensorController
-from camera_sentiment import CameraSentiment
-from speech_engine import SpeechEngine
-from gemini_brain import GeminiBrain
-from face_display import FaceDisplay
-from navigation import NavigationController
+# Import the base ECHO class
+from main import ECHO
+from config import WAKE_WORD_ENABLED, WAKE_WORD_PHRASES, CAMERA_WIDTH, CAMERA_HEIGHT
 
 
 # ═══════════════════════════════════════════════════
@@ -87,58 +83,23 @@ def box(lines):
 
 
 # ═══════════════════════════════════════════════════
-# Debug ECHO Controller
+# Debug ECHO Controller (inherits from ECHO)
 # ═══════════════════════════════════════════════════
 
-class ECHODebug:
+class ECHODebug(ECHO):
     """
-    Same as ECHO but with verbose terminal output for every step.
-    All inputs (speech, emotion, sensors) and outputs (responses,
-    motor commands) are printed in real-time.
+    Inherits all functionality from ECHO, adding verbose terminal output
+    for every step. All inputs (speech, emotion, sensors) and outputs
+    (responses, motor commands) are printed in real-time.
     """
 
     def __init__(self):
         banner("🤖 ECHO Robot — DEBUG MODE")
 
-        self._running = False
+        # Initialize the base ECHO class (all subsystems)
+        super().__init__()
 
-        # ── Initialize all subsystems ──
-        dp("INIT", "Initializing motors...", C_CYAN)
-        self.motors = MotorController()
-        dp("INIT", "✅ Motors ready", C_GREEN)
-
-        dp("INIT", "Initializing sensors...", C_CYAN)
-        self.sensors = SensorController()
-        dp("INIT", "✅ Sensors ready", C_GREEN)
-
-        dp("INIT", "Initializing camera & sentiment...", C_CYAN)
-        self.camera = CameraSentiment()
-        dp("INIT", "✅ Camera ready", C_GREEN)
-
-        dp("INIT", "Initializing speech engine...", C_CYAN)
-        self.speech = SpeechEngine()
-        dp("INIT", "✅ Speech engine ready", C_GREEN)
-
-        dp("INIT", "Initializing AI brain...", C_CYAN)
-        self.brain = GeminiBrain()
-        dp("INIT", "✅ AI brain ready", C_GREEN)
-
-        dp("INIT", "Initializing face display...", C_CYAN)
-        self.face = FaceDisplay()
-        dp("INIT", "✅ Face display ready", C_GREEN)
-
-        dp("INIT", "Initializing navigation...", C_CYAN)
-        self.nav = NavigationController(self.motors, self.sensors, self.camera)
-        dp("INIT", "✅ Navigation ready", C_GREEN)
-
-        # Signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        # Safety stop
-        self.motors.stop()
-
-        # Stats
+        # Debug-specific stats
         self._loop_count = 0
         self._listen_count = 0
         self._speak_count = 0
@@ -154,12 +115,12 @@ class ECHODebug:
         """Start all services and enter the debug main loop."""
         self._running = True
 
-        # Start background services
+        # Start background services (same as base class)
         self.sensors.start_monitoring(interval=0.2)
         self.camera.start_analysis()
         self.face.start()
 
-        # Start sensor monitor thread
+        # Debug-specific: sensor monitor thread
         self._sensor_thread = threading.Thread(
             target=self._sensor_debug_loop, daemon=True
         )
@@ -198,9 +159,9 @@ class ECHODebug:
         """Print sensor readings periodically."""
         while self._running:
             try:
-                dist = self.sensors.distance_cm
-                ir = self.sensors.ir_obstacle
-                obstacle = self.sensors.obstacle_detected
+                dist = self.sensors.last_distance
+                ir = self.sensors.last_ir_blocked
+                obstacle = self.sensors.is_obstacle_ahead()
                 emo = self.camera.current_emotion
                 emo_conf = self.camera.current_confidence
 
@@ -214,7 +175,7 @@ class ECHODebug:
             time.sleep(5)
 
     def _main_loop(self):
-        """Core debug loop — same as main.py but with print statements."""
+        """Core debug loop — same as ECHO but with print statements."""
         while self._running:
             try:
                 self._loop_count += 1
@@ -236,6 +197,27 @@ class ECHODebug:
                 self._listen_count += 1
                 dp("INPUT", f"👤 User said: \"{user_text}\"", C_GREEN)
 
+                # ── Wake word gate (optional) ──
+                if WAKE_WORD_ENABLED:
+                    text_lower = user_text.lower().strip()
+                    matched_phrase = None
+                    for phrase in WAKE_WORD_PHRASES:
+                        if text_lower.startswith(phrase):
+                            matched_phrase = phrase
+                            break
+
+                    if matched_phrase is None:
+                        dp("WAKE", f"No wake word — ignoring: \"{user_text}\"", C_DIM)
+                        continue
+
+                    user_text = user_text[len(matched_phrase):].strip(" ,!.")
+                    dp("WAKE", f"Wake word '{matched_phrase}' detected", C_GREEN)
+                    if not user_text:
+                        dp("WAKE", "Just wake word, no command — saying 'Yes?'", C_YELLOW)
+                        self.speech.speak("Yes?", force_fallback=True)
+                        self._speak_count += 1
+                        continue
+
                 # ── Step 2: Get emotion ──
                 emotion = self.camera.current_emotion
                 confidence = self.camera.current_confidence
@@ -252,20 +234,51 @@ class ECHODebug:
                         except Exception as e:
                             dp("EMOTION", f"Gemini fallback failed: {e}", C_RED)
 
+                # ── Step 2b: Update face gaze to track detected face ──
+                face_center = self.camera.get_face_center()
+                if face_center is not None:
+                    cx, cy = face_center
+                    gaze_x = (cx / (CAMERA_WIDTH / 2)) - 1.0
+                    gaze_y = (cy / (CAMERA_HEIGHT / 2)) - 1.0
+                    self.face.set_gaze(gaze_x, gaze_y)
+                    dp("GAZE", f"Face at ({cx},{cy}) → gaze ({gaze_x:.2f},{gaze_y:.2f})", C_DIM)
+
                 # ── Step 3: Parse command ──
                 command = self.brain.interpret_command(user_text)
                 cmd_type = command['type']
+
+                # Hybrid NLP: if local match returns 'chat', try Gemini NLP
+                # classification for natural language movement phrases
+                if cmd_type == 'chat':
+                    nlp_command = self.brain.interpret_command_nlp(user_text)
+                    if nlp_command['type'] != 'chat':
+                        command = nlp_command
+                        cmd_type = command['type']
+                        dp("NLP", f"🧠 Reclassified '{user_text}' → {cmd_type}", C_GREEN)
+
                 cmd_dir = command.get('direction', '')
                 dp("COMMAND", f"Type: {cmd_type}" + (f" → {cmd_dir}" if cmd_dir else ""), C_MAGENTA)
                 self._cmd_counts[cmd_type] = self._cmd_counts.get(cmd_type, 0) + 1
 
-                # ── Step 4: Execute ──
+                # ── Step 4: Execute (uses overridden handlers with debug output) ──
                 if cmd_type == 'move':
                     self._handle_move(command)
+                elif cmd_type == 'keep_moving':
+                    self._handle_keep_moving(command)
+                elif cmd_type == 'safe_move':
+                    self._handle_safe_move(command)
+                elif cmd_type == 'patrol':
+                    self._handle_patrol()
                 elif cmd_type == 'follow':
                     self._handle_follow()
                 elif cmd_type == 'stop':
                     self._handle_stop()
+                elif cmd_type == 'clear_history':
+                    self._handle_clear_history()
+                elif cmd_type == 'look':
+                    self._handle_look()
+                elif cmd_type == 'volume':
+                    self._handle_volume(command)
                 elif cmd_type == 'chat':
                     self._handle_chat(user_text, emotion, confidence)
 
@@ -283,83 +296,129 @@ class ECHODebug:
                 time.sleep(1)
 
     # ═══════════════════════════════════════════
-    # Command Handlers (with debug output)
+    # Command Handlers (override base with debug output)
     # ═══════════════════════════════════════════
 
     def _handle_move(self, command: dict):
         """Handle movement with debug output."""
         direction = command['direction']
-        dp("MOVE", f"Executing movement: {direction}", C_CYAN)
+        duration = command.get('duration', None)
+        dp("MOVE", f"Executing movement: {direction}" + (f" for {duration}s" if duration else ""), C_CYAN)
 
-        self.face.set_emotion("neutral")
-
-        ack = {
-            'forward':  "Moving forward!",
-            'backward': "Going backward!",
-            'left':     "Turning left!",
-            'right':    "Turning right!",
-        }.get(direction, "Moving!")
-
-        # Speak in thread
-        t = threading.Thread(target=self.speech.speak, args=(ack,), daemon=True)
-        t.start()
+        # Use base class handler (which speaks ack + executes move)
+        super()._handle_move(command)
         self._speak_count += 1
-        dp("SPEAK", f"🔊 \"{ack}\"", C_MAGENTA)
 
-        success = self.nav.execute_move(direction)
+        success = not self.sensors.is_obstacle_ahead()  # Approximate check for debug output
         dp("MOVE", f"Result: {'✅ SUCCESS' if success else '❌ BLOCKED'}", C_GREEN if success else C_RED)
 
-        if not success:
-            self.speech.speak("I can't move that way, there's something in front of me!")
-            self._speak_count += 1
-            self.face.set_emotion("surprise")
-            time.sleep(1)
-            self.face.set_emotion("neutral")
+    def _handle_keep_moving(self, command: dict):
+        """Handle continuous movement with debug output."""
+        direction = command.get('direction', 'forward')
+        dp("MOVE", f"Starting continuous {direction} movement", C_CYAN)
+        super()._handle_keep_moving(command)
+        self._speak_count += 1
+
+    def _handle_safe_move(self, command: dict):
+        """Handle obstacle-aware movement with debug output."""
+        direction = command.get('direction', 'forward')
+        dp("MOVE", f"Safe move: {direction} with obstacle checking", C_CYAN)
+        super()._handle_safe_move(command)
+        self._speak_count += 1
+        dp("MOVE", "Safe forward running in background", C_GREEN)
+
+    def _handle_patrol(self):
+        """Handle patrol mode with debug output."""
+        dp("MOVE", "Starting patrol mode", C_MAGENTA)
+        super()._handle_patrol()
+        self._speak_count += 1
 
     def _handle_follow(self):
         """Handle follow mode with debug output."""
         dp("FOLLOW", "Starting follow mode", C_MAGENTA)
-        self.face.set_emotion("happy")
-        self.speech.speak("I'll follow you! Say stop when you want me to stop.", emotion="happy")
+        super()._handle_follow()
         self._speak_count += 1
         dp("SPEAK", "🔊 Follow mode announcement", C_MAGENTA)
-        self.nav.start_follow()
 
     def _handle_stop(self):
         """Handle stop with debug output."""
         dp("STOP", "🛑 Emergency stop!", C_RED)
-        self.nav.emergency_stop()
-        self.face.set_emotion("neutral")
-        self.speech.speak("Stopping!", emotion="neutral")
+        super()._handle_stop()
         self._speak_count += 1
 
+    def _handle_clear_history(self):
+        """Handle clear history with debug output."""
+        dp("BRAIN", "Clearing conversation history", C_MAGENTA)
+        super()._handle_clear_history()
+        self._speak_count += 1
+
+    def _handle_look(self):
+        """Handle look/scene description with debug output."""
+        dp("VISION", "Capturing frame for Gemini scene analysis...", C_CYAN)
+        super()._handle_look()
+        self._speak_count += 1
+
+    def _handle_volume(self, command: dict):
+        """Handle volume with debug output."""
+        direction = command.get('direction', 'up')
+        dp("VOLUME", f"Volume {direction} requested (current: {self.speech.volume:.2f}x)", C_CYAN)
+        super()._handle_volume(command)
+        self._speak_count += 1
+        dp("VOLUME", f"Volume now: {self.speech.volume:.2f}x", C_GREEN)
+
     def _handle_chat(self, user_text: str, emotion: str, confidence: float):
-        """Handle conversation with full debug output."""
+        """Handle conversation with streaming think→TTS pipeline + debug output."""
         self.face.set_emotion(emotion)
 
-        dp("BRAIN", f"Sending to Gemini...", C_MAGENTA)
+        dp("BRAIN", f"Sending to Gemini (streaming)...", C_MAGENTA)
         dp("BRAIN", f"  Input: \"{user_text}\"", C_MAGENTA)
         dp("BRAIN", f"  Emotion context: {emotion} ({confidence:.0%})", C_MAGENTA)
 
-        response = self.brain.think(user_text, emotion, confidence)
-
-        if not response:
-            response = "Hmm, I'm not sure what to say about that."
-            dp("BRAIN", "⚠️  No response from Gemini, using default", C_YELLOW)
-
-        dp("OUTPUT", f"🤖 ECHO says: \"{response}\"", C_GREEN)
-
-        # Determine response emotion
-        response_emotion = self.brain.determine_response_emotion(response, emotion)
-        dp("EMOTION", f"Response emotion: {response_emotion}", C_CYAN)
-
-        # Speak with emotion
-        self.face.set_emotion(response_emotion)
+        # "Thinking" indicator
         self.face.set_talking(True)
 
-        dp("SPEAK", f"🔊 Speaking with emotion={response_emotion}...", C_MAGENTA)
-        self.speech.speak(response, emotion=response_emotion)
-        self._speak_count += 1
+        # Play brief audio cue so user knows ECHO heard them
+        self.speech.play_thinking_cue()
+        dp("SPEAK", "♪ Thinking cue played", C_DIM)
+
+        # Stream Gemini response sentence-by-sentence
+        full_response = ""
+        first_sentence = True
+        response_emotion = emotion  # default until first sentence arrives
+        sentence_count = 0
+
+        for sentence in self.brain.think_stream(user_text, emotion, confidence):
+            sentence_count += 1
+            if first_sentence:
+                self.face.set_talking(False)  # Stop thinking indicator
+                first_sentence = False
+
+                # Determine response emotion from first sentence
+                response_emotion = self.brain.determine_response_emotion(sentence, emotion)
+                dp("EMOTION", f"Response emotion: {response_emotion}", C_CYAN)
+                self.face.set_emotion(response_emotion)
+
+            full_response += sentence + " "
+            dp("STREAM", f"  [{sentence_count}] \"{sentence}\"", C_GREEN)
+
+            # Speak each sentence as it arrives
+            self.face.set_talking(True)
+            self.speech.speak(sentence, emotion=response_emotion)
+            self._speak_count += 1
+
+        # If no sentences came through (empty response)
+        if not full_response.strip():
+            self.face.set_talking(False)
+            full_response = "Hmm, I'm not sure what to say about that."
+            response_emotion = "neutral"
+            dp("BRAIN", "⚠️  No response from Gemini, using default", C_YELLOW)
+            self.face.set_emotion(response_emotion)
+            self.face.set_talking(True)
+            self.speech.speak(full_response, emotion=response_emotion)
+            self._speak_count += 1
+
+        dp("OUTPUT", f"🤖 ECHO says: \"{full_response.strip()}\"", C_GREEN)
+        dp("STREAM", f"Total sentences streamed: {sentence_count}", C_DIM)
 
         self.face.set_talking(False)
         time.sleep(0.5)
@@ -369,30 +428,12 @@ class ECHODebug:
     # Shutdown
     # ═══════════════════════════════════════════
 
-    def _signal_handler(self, signum, frame):
-        dp("SIGNAL", f"Signal {signum} received — shutting down", C_RED)
-        self._running = False
-
     def shutdown(self):
         """Clean shutdown with summary."""
         banner("🤖 ECHO — Shutting Down (DEBUG)")
 
-        self._running = False
-
-        self.face.set_emotion("sad")
-        try:
-            self.speech.speak("Goodbye from debug mode!", emotion="sad")
-        except Exception:
-            pass
-
-        # Cleanup all subsystems
-        self.nav.cleanup()
-        self.face.cleanup()
-        self.brain.cleanup()
-        self.speech.cleanup()
-        self.camera.cleanup()
-        self.sensors.cleanup()
-        self.motors.cleanup()
+        # Call base class shutdown (cleans up all subsystems)
+        super().shutdown()
 
         # Print session summary
         print()

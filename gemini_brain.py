@@ -8,10 +8,17 @@ Also provides vision capability via Gemini Robotics-ER for person detection
 and scene understanding when needed.
 """
 
+import re
 import logging
 import threading
+from typing import Generator
 
 logger = logging.getLogger("echo.brain")
+
+# Pre-compile regex used on every command parse
+_DURATION_RE = re.compile(r'for\s+(\d+)\s*(?:second|sec|s\b)')
+# Sentence boundary for streaming: split on . ! ? followed by space or end
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
 
 try:
     from google import genai
@@ -29,6 +36,9 @@ from config import (
 
 class GeminiBrain:
     """Gemini-powered conversational AI with emotion awareness."""
+
+    # Maximum chat history entries to keep in memory (pairs of user+model)
+    MAX_HISTORY_ENTRIES = 40  # 20 exchanges
 
     def __init__(self):
         self._client = None
@@ -75,26 +85,12 @@ class GeminiBrain:
         logger.info(f"🧠 Thinking... input='{user_text}' emotion={emotion}")
 
         try:
-            # Build conversation with system prompt + history
-            messages = [
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=SYSTEM_PROMPT)]
-                ),
-                types.Content(
-                    role="model",
-                    parts=[types.Part.from_text(
-                        text=(
-                            "Understood! I'm ECHO, ready to be a warm and empathetic companion. "
-                            "I'll keep my responses concise and emotionally aware."
-                        )
-                    )]
-                ),
-            ]
+            # Build conversation with history (system prompt sent via config)
+            messages = []
 
-            # Add conversation history (keep last 10 exchanges)
+            # Add conversation history (keep last 20 exchanges = 40 entries)
             with self._lock:
-                for entry in self._chat_history[-20:]:
+                for entry in self._chat_history[-self.MAX_HISTORY_ENTRIES:]:
                     messages.append(entry)
 
             # Add current user message
@@ -104,11 +100,12 @@ class GeminiBrain:
             )
             messages.append(user_content)
 
-            # Call Gemini
+            # Call Gemini with system_instruction (proper API usage, saves tokens)
             response = self._client.models.generate_content(
                 model=GEMINI_CHAT_MODEL,
                 contents=messages,
                 config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
                     temperature=0.8,
                     max_output_tokens=350,  # Rich conversational responses
                     top_p=0.9,
@@ -127,6 +124,9 @@ class GeminiBrain:
             with self._lock:
                 self._chat_history.append(user_content)
                 self._chat_history.append(model_content)
+                # Trim to prevent unbounded memory growth
+                if len(self._chat_history) > self.MAX_HISTORY_ENTRIES:
+                    self._chat_history = self._chat_history[-self.MAX_HISTORY_ENTRIES:]
 
             return reply
 
@@ -134,14 +134,109 @@ class GeminiBrain:
             logger.error(f"Gemini API error: {e}")
             return "Sorry, I had a little hiccup thinking about that. Can you say that again?"
 
+    def think_stream(self, user_text: str, emotion: str = "neutral", confidence: float = 0.0) -> Generator[str, None, None]:
+        """
+        Streaming version of think() — yields sentences as they become available.
+        This allows TTS to start speaking the first sentence while the rest
+        is still being generated, saving 1-3 seconds of perceived latency.
+
+        Yields:
+            Individual sentences as they are completed.
+            The full response is also saved to chat history after all chunks.
+        """
+        if self._client is None:
+            yield "I'm having trouble connecting to my brain right now. Let me try again."
+            return
+
+        # Build the message with emotion context
+        emotion_tag = ""
+        if emotion != "neutral" and confidence > 0.3:
+            emotion_tag = f"[EMOTION DETECTED: {emotion} (confidence: {confidence:.0%})]\n"
+
+        full_message = f"{emotion_tag}User says: {user_text}"
+
+        logger.info(f"🧠 Thinking (stream)... input='{user_text}' emotion={emotion}")
+
+        try:
+            # Build conversation with history
+            messages = []
+            with self._lock:
+                for entry in self._chat_history[-self.MAX_HISTORY_ENTRIES:]:
+                    messages.append(entry)
+
+            user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=full_message)]
+            )
+            messages.append(user_content)
+
+            # Stream the response from Gemini
+            response_stream = self._client.models.generate_content_stream(
+                model=GEMINI_CHAT_MODEL,
+                contents=messages,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.8,
+                    max_output_tokens=350,
+                    top_p=0.9,
+                ),
+            )
+
+            # Accumulate text and yield complete sentences
+            buffer = ""
+            full_reply = ""
+
+            for chunk in response_stream:
+                if chunk.text:
+                    buffer += chunk.text
+
+                    # Split buffer on sentence boundaries
+                    sentences = _SENTENCE_RE.split(buffer)
+                    # Keep the last fragment (may be incomplete sentence)
+                    if len(sentences) > 1:
+                        # Yield all complete sentences
+                        for sentence in sentences[:-1]:
+                            sentence = sentence.strip()
+                            if sentence:
+                                full_reply += sentence + " "
+                                yield sentence
+                        buffer = sentences[-1]
+
+            # Yield any remaining text in buffer
+            remaining = buffer.strip()
+            if remaining:
+                full_reply += remaining
+                yield remaining
+
+            full_reply = full_reply.strip()
+            logger.info(f"💬 Gemini says (streamed): '{full_reply[:80]}...'")
+
+            # Update history with the complete response
+            model_content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=full_reply)]
+            )
+            with self._lock:
+                self._chat_history.append(user_content)
+                self._chat_history.append(model_content)
+                if len(self._chat_history) > self.MAX_HISTORY_ENTRIES:
+                    self._chat_history = self._chat_history[-self.MAX_HISTORY_ENTRIES:]
+
+        except Exception as e:
+            logger.error(f"Gemini streaming API error: {e}")
+            yield "Sorry, I had a little hiccup thinking about that. Can you say that again?"
+
     def interpret_command(self, text: str) -> dict:
         """
         Parse user text to determine if it's a movement command or conversation.
 
         Returns dict with:
-            - 'type': 'move' | 'keep_moving' | 'safe_move' | 'patrol' | 'follow' | 'stop' | 'chat'
+            - 'type': 'move' | 'keep_moving' | 'safe_move' | 'patrol' |
+                      'follow' | 'stop' | 'clear_history' | 'look' |
+                      'volume' | 'chat'
             - 'direction': 'forward' | 'backward' | 'left' | 'right' (for move)
             - 'duration': optional float seconds
+            - 'volume_direction': 'up' | 'down' (for volume)
             - 'text': original text
         """
         text_lower = text.lower().strip()
@@ -192,8 +287,7 @@ class GeminiBrain:
 
         # ── PRIORITY 3: Duration extraction: "go forward for 3 seconds" ──
         duration = None
-        import re
-        dur_match = re.search(r'for\s+(\d+)\s*(?:second|sec|s\b)', text_lower)
+        dur_match = _DURATION_RE.search(text_lower)
         if dur_match:
             duration = float(dur_match.group(1))
 
@@ -219,12 +313,102 @@ class GeminiBrain:
         if any(kw in text_lower for kw in ['spin', 'turn around', 'circle', '360', 'rotate']):
             return {'type': 'move', 'direction': 'right', 'duration': 2.0, 'text': text}
 
-        # Follow commands
-        if any(kw in text_lower for kw in ['follow me', 'follow', 'come with me', 'come here']):
+        # Follow commands — require explicit "follow me" or "come with/here"
+        # "follow" alone is too broad (matches "can you follow instructions?")
+        follow_phrases = ['follow me', 'come with me', 'come here', 'come to me']
+        if any(kw in text_lower for kw in follow_phrases):
             return {'type': 'follow', 'text': text}
+
+        # Clear history / forget command
+        if any(kw in text_lower for kw in ['clear history', 'forget everything',
+                                            'start over', 'reset conversation',
+                                            'new conversation', 'forget what']):
+            return {'type': 'clear_history', 'text': text}
+
+        # "What do you see?" / "look around" / "describe" — visual query
+        look_phrases = ['what do you see', 'look around', 'describe what',
+                        'what\'s around', 'what is around', 'what\'s in front',
+                        'who do you see', 'can you see', 'what are you looking at']
+        if any(kw in text_lower for kw in look_phrases):
+            return {'type': 'look', 'text': text}
+
+        # Volume control — louder / quieter / volume up / volume down
+        if any(kw in text_lower for kw in ['louder', 'volume up', 'speak up',
+                                            'turn up', 'raise volume', 'too quiet']):
+            return {'type': 'volume', 'direction': 'up', 'text': text}
+        if any(kw in text_lower for kw in ['quieter', 'volume down', 'lower volume',
+                                            'turn down', 'too loud', 'not so loud',
+                                            'speak softer', 'softer']):
+            return {'type': 'volume', 'direction': 'down', 'text': text}
 
         # Everything else is conversation
         return {'type': 'chat', 'text': text}
+
+    def interpret_command_nlp(self, text: str) -> dict:
+        """
+        Use Gemini to interpret ambiguous natural language as a robot command.
+        Called as a fallback when local keyword matching returns 'chat' but the
+        text might be a movement/action command phrased in natural language
+        (e.g., "come ahead", "move closer", "go that way").
+
+        Returns:
+            Same dict format as interpret_command(). Returns {'type': 'chat'}
+            if Gemini determines it's just conversation.
+        """
+        if self._client is None:
+            return {'type': 'chat', 'text': text}
+
+        try:
+            import json as _json
+            prompt = (
+                "You are a robot command classifier. Given the user's speech, determine if it's "
+                "a physical movement command or just conversation.\n\n"
+                "Valid command types:\n"
+                '- {"type":"move","direction":"forward"} — move forward (includes: come ahead, move closer, approach, come to me, walk forward, go)\n'
+                '- {"type":"move","direction":"backward"} — move backward (includes: back away, retreat, move away)\n'
+                '- {"type":"move","direction":"left"} — turn left\n'
+                '- {"type":"move","direction":"right"} — turn right\n'
+                '- {"type":"stop"} — stop moving (includes: wait, hold on, stay)\n'
+                '- {"type":"follow"} — follow the person\n'
+                '- {"type":"patrol"} — patrol/explore\n'
+                '- {"type":"chat"} — not a movement command, just conversation\n\n'
+                f'User said: "{text}"\n\n'
+                "Respond with ONLY a JSON object. No markdown, no explanation."
+            )
+
+            response = self._client.models.generate_content(
+                model=GEMINI_CHAT_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=64,
+                ),
+            )
+
+            result_text = response.text.strip()
+            # Clean markdown code fences if present
+            if result_text.startswith("```"):
+                result_text = result_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+            data = _json.loads(result_text)
+            cmd_type = data.get("type", "chat")
+
+            # Validate and return
+            if cmd_type == "move":
+                direction = data.get("direction", "forward")
+                if direction in ("forward", "backward", "left", "right"):
+                    logger.info(f"🧠 NLP classified as move:{direction}")
+                    return {'type': 'move', 'direction': direction, 'text': text}
+            elif cmd_type in ("stop", "follow", "patrol"):
+                logger.info(f"🧠 NLP classified as {cmd_type}")
+                return {'type': cmd_type, 'text': text}
+
+            # Default to chat
+            return {'type': 'chat', 'text': text}
+
+        except Exception as e:
+            logger.warning(f"NLP command interpretation failed: {e}")
+            return {'type': 'chat', 'text': text}
 
     def analyze_scene(self, image_bytes: bytes) -> str:
         """

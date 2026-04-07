@@ -16,7 +16,6 @@ Run on Raspberry Pi 4B:
     python3 main.py
 """
 
-import sys
 import time
 import signal
 import logging
@@ -31,7 +30,6 @@ logging.basicConfig(
 logger = logging.getLogger("echo.main")
 
 # ─── Import Subsystems ───
-from config import FOLLOW_MODE_ENABLED
 from motor_controller import MotorController
 from sensor_controller import SensorController
 from camera_sentiment import CameraSentiment
@@ -39,6 +37,7 @@ from speech_engine import SpeechEngine
 from gemini_brain import GeminiBrain
 from face_display import FaceDisplay
 from navigation import NavigationController
+from config import WAKE_WORD_ENABLED, WAKE_WORD_PHRASES, CAMERA_WIDTH, CAMERA_HEIGHT
 
 
 class ECHO:
@@ -136,16 +135,64 @@ class ECHO:
                     time.sleep(0.1)
                     continue
 
-                logger.info(f"👤 User said: '{user_text}'")
+                # ── Wake word gate (optional) ──
+                # When enabled, discard speech that doesn't start with a wake phrase.
+                if WAKE_WORD_ENABLED:
+                    text_lower = user_text.lower().strip()
+                    matched_phrase = None
+                    for phrase in WAKE_WORD_PHRASES:
+                        if text_lower.startswith(phrase):
+                            matched_phrase = phrase
+                            break
+
+                    if matched_phrase is None:
+                        logger.debug(f"Wake word not detected, ignoring: '{user_text}'")
+                        continue
+
+                    # Strip the wake phrase from the command
+                    user_text = user_text[len(matched_phrase):].strip(" ,!.")
+                    if not user_text:
+                        # Just the wake word with nothing after — acknowledge and listen again
+                        self.speech.speak("Yes?", force_fallback=True)
+                        continue
+
+                logger.info(f"User said: '{user_text}'")
 
                 # ── Step 2: Get current emotion from camera ──
-                # Use local TFLite model only (skip Gemini API fallback to save ~4s latency)
+                # Use local TFLite model; fall back to Gemini vision if low confidence
                 emotion = self.camera.current_emotion
                 confidence = self.camera.current_confidence
+                if emotion == "neutral" and confidence < 0.3:
+                    # Low confidence — try Gemini vision fallback
+                    frame_jpeg = self.camera.get_frame_jpeg()
+                    if frame_jpeg:
+                        try:
+                            emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
+                        except Exception as e:
+                            logger.debug(f"Gemini emotion fallback failed: {e}")
                 logger.info(f"😊 Detected emotion: {emotion} ({confidence:.0%})")
 
+                # ── Step 2b: Update face gaze to track detected face ──
+                face_center = self.camera.get_face_center()
+                if face_center is not None:
+                    cx, cy = face_center
+                    gaze_x = (cx / (CAMERA_WIDTH / 2)) - 1.0
+                    gaze_y = (cy / (CAMERA_HEIGHT / 2)) - 1.0
+                    self.face.set_gaze(gaze_x, gaze_y)
+
                 # ── Step 3: Interpret command ──
+                # Fast local keyword matching first; if it returns 'chat',
+                # try NLP classification for natural language movement phrases
+                # (e.g. "come ahead", "move closer") before treating as conversation.
                 command = self.brain.interpret_command(user_text)
+
+                if command['type'] == 'chat':
+                    # Hybrid NLP: ask Gemini if this is a movement command
+                    nlp_command = self.brain.interpret_command_nlp(user_text)
+                    if nlp_command['type'] != 'chat':
+                        command = nlp_command
+                        logger.info(f"🧠 NLP reclassified '{user_text}' → {command['type']}")
+
                 logger.info(f"🎯 Command type: {command['type']}")
 
                 if command['type'] == 'move':
@@ -165,6 +212,15 @@ class ECHO:
 
                 elif command['type'] == 'stop':
                     self._handle_stop()
+
+                elif command['type'] == 'clear_history':
+                    self._handle_clear_history()
+
+                elif command['type'] == 'look':
+                    self._handle_look()
+
+                elif command['type'] == 'volume':
+                    self._handle_volume(command)
 
                 elif command['type'] == 'chat':
                     self._handle_chat(user_text, emotion, confidence)
@@ -186,12 +242,25 @@ class ECHO:
         # Update face
         self.face.set_emotion("neutral")
 
-        # Execute movement FIRST (don't wait for TTS)
+        # Speak acknowledgment in background (non-blocking so movement starts fast)
+        ack = {
+            'forward':  "Moving forward!",
+            'backward': "Going backward!",
+            'left':     "Turning left!",
+            'right':    "Turning right!",
+        }.get(direction, "Moving!")
+        ack_thread = threading.Thread(
+            target=self.speech.speak, args=(ack,),
+            kwargs={'force_fallback': True}, daemon=True,
+        )
+        ack_thread.start()
+
+        # Execute movement
         success = self.nav.execute_move(direction, duration=duration)
 
         if not success:
-            # Only speak on failure (obstacle blocked)
-            self.speech._speak_fallback("Obstacle ahead!")
+            # Speak on failure (obstacle blocked)
+            self.speech.speak("Obstacle ahead!", force_fallback=True)
             self.face.set_emotion("surprise")
             time.sleep(0.5)
             self.face.set_emotion("neutral")
@@ -201,7 +270,7 @@ class ECHO:
         direction = command.get('direction', 'forward')
         logger.info(f"🔄 Starting continuous {direction} movement")
         self.face.set_emotion("neutral")
-        self.speech._speak_fallback(f"Moving {direction}. Say stop to halt.")
+        self.speech.speak(f"Moving {direction}. Say stop to halt.", force_fallback=True)
         self.nav.start_continuous_move(direction)
 
     def _handle_safe_move(self, command: dict):
@@ -209,21 +278,15 @@ class ECHO:
         direction = command.get('direction', 'forward')
         logger.info(f"🛡️ Safe move: {direction} with obstacle checking")
         self.face.set_emotion("neutral")
-        self.speech._speak_fallback(f"Moving carefully. I'll stop if I see an obstacle.")
-        success = self.nav.safe_forward(duration=8.0)
-        if not success:
-            self.speech._speak_fallback("I stopped because I detected an obstacle ahead.")
-            self.face.set_emotion("surprise")
-            time.sleep(0.5)
-            self.face.set_emotion("neutral")
-        else:
-            self.speech._speak_fallback("Done! Path was clear.")
+        self.speech.speak(f"Moving carefully. I'll stop if I see an obstacle.", force_fallback=True)
+        # safe_forward now runs in background — non-blocking so robot stays responsive
+        self.nav.safe_forward(duration=8.0)
 
     def _handle_patrol(self):
         """Handle patrol / back-and-forth movement."""
         logger.info("🔄 Starting patrol mode")
         self.face.set_emotion("happy")
-        self.speech._speak_fallback("Patrolling! Say stop when you want me to halt.")
+        self.speech.speak("Patrolling! Say stop when you want me to halt.", force_fallback=True)
         self.nav.start_patrol()
 
     def _handle_follow(self):
@@ -237,29 +300,97 @@ class ECHO:
         self.nav.stop_continuous()  # Stop continuous/patrol modes too
         self.nav.emergency_stop()
         self.face.set_emotion("neutral")
-        self.speech._speak_fallback("Stopped!")
+        self.speech.speak("Stopped!", force_fallback=True)
+
+    def _handle_clear_history(self):
+        """Handle clear conversation history command."""
+        self.brain.clear_history()
+        self.face.set_emotion("neutral")
+        self.speech.speak("Conversation cleared! Let's start fresh.", force_fallback=True)
+        logger.info("Conversation history cleared by voice command")
+
+    def _handle_look(self):
+        """Handle 'what do you see' — sends camera frame to Gemini for scene description."""
+        self.face.set_emotion("surprise")
+        self.speech.speak("Let me take a look!", force_fallback=True)
+
+        frame_jpeg = self.camera.get_frame_jpeg()
+        if frame_jpeg is None:
+            self.speech.speak("I can't see anything right now. My camera might be off.", force_fallback=True)
+            self.face.set_emotion("sad")
+            time.sleep(0.5)
+            self.face.set_emotion("neutral")
+            return
+
+        self.face.set_talking(True)  # Thinking indicator
+        description = self.brain.analyze_scene(frame_jpeg)
+        self.face.set_talking(False)
+
+        if description:
+            response_emotion = self.brain.determine_response_emotion(description, "neutral")
+            self.face.set_emotion(response_emotion)
+            self.face.set_talking(True)
+            self.speech.speak(description, emotion=response_emotion)
+            self.face.set_talking(False)
+        else:
+            self.speech.speak("I looked but I'm having trouble describing what I see.", force_fallback=True)
+
+        time.sleep(0.5)
+        self.face.set_emotion("neutral")
+
+    def _handle_volume(self, command: dict):
+        """Handle volume up/down voice commands."""
+        direction = command.get('direction', 'up')
+        delta = 0.25 if direction == 'up' else -0.25
+        new_vol = self.speech.adjust_volume(delta)
+        pct = int(new_vol / 2.0 * 100)  # 2.0 is max → 100%
+        if direction == 'up':
+            self.speech.speak(f"Volume up! Now at {pct} percent.", force_fallback=True)
+        else:
+            self.speech.speak(f"Volume down. Now at {pct} percent.", force_fallback=True)
+        logger.info(f"Volume adjusted {direction}: {new_vol:.2f}x ({pct}%)")
 
     def _handle_chat(self, user_text: str, emotion: str, confidence: float):
-        """Handle conversational input."""
+        """Handle conversational input with streaming think→TTS pipeline.
+        Speaks the first sentence while Gemini continues generating the rest,
+        reducing perceived latency by 1-3 seconds."""
         # Show detected user emotion while thinking
         self.face.set_emotion(emotion)
 
-        # Get Gemini response
-        response = self.brain.think(user_text, emotion, confidence)
+        # "Thinking" indicator — show on face while waiting for Gemini (1-3s gap)
+        self.face.set_talking(True)  # Subtle visual cue that ECHO is processing
 
-        if not response:
+        # Play brief audio cue so user knows ECHO heard them
+        self.speech.play_thinking_cue()
+
+        # Stream Gemini response sentence-by-sentence
+        full_response = ""
+        first_sentence = True
+
+        for sentence in self.brain.think_stream(user_text, emotion, confidence):
+            if first_sentence:
+                self.face.set_talking(False)  # Stop thinking indicator
+                first_sentence = False
+
+                # Determine response emotion from first sentence
+                response_emotion = self.brain.determine_response_emotion(sentence, emotion)
+                logger.info(f"🎭 Response emotion: {response_emotion}")
+                self.face.set_emotion(response_emotion)
+
+            full_response += sentence + " "
+
+            # Speak each sentence as it arrives
+            self.face.set_talking(True)
+            self.speech.speak(sentence, emotion=response_emotion if not first_sentence else emotion)
+
+        # If no sentences came through (empty response)
+        if not full_response.strip():
+            self.face.set_talking(False)
             response = "Hmm, I'm not sure what to say about that."
-
-        # Determine response emotion based on what ECHO says
-        response_emotion = self.brain.determine_response_emotion(response, emotion)
-        logger.info(f"🎭 Response emotion: {response_emotion}")
-
-        # Switch face to response emotion and start talking
-        self.face.set_emotion(response_emotion)
-        self.face.set_talking(True)
-
-        # Speak the response
-        self.speech.speak(response, emotion=response_emotion)
+            response_emotion = "neutral"
+            self.face.set_emotion(response_emotion)
+            self.face.set_talking(True)
+            self.speech.speak(response, emotion=response_emotion)
 
         # Stop talking animation
         self.face.set_talking(False)

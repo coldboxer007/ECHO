@@ -43,7 +43,6 @@ class C:
     BOLD    = "\033[1m"
 
 # ─── Import Subsystems ───
-from config import FOLLOW_MODE_ENABLED
 from motor_controller import MotorController
 from sensor_controller import SensorController
 from camera_sentiment import CameraSentiment
@@ -186,8 +185,8 @@ class ECHOLive:
             # Check sensors
             if now - last_sensor_time > SENSOR_INTERVAL:
                 try:
-                    distance = self.sensors.get_distance()
-                    ir_obstacle = self.sensors.check_ir_obstacle()
+                    distance = self.sensors.read_distance()
+                    ir_obstacle = self.sensors.read_ir()
                     if distance is not None and distance < 15:
                         self.motors.stop()
                 except Exception:

@@ -9,15 +9,15 @@ faster-whisper>=1.0.0
 
 # ── Audio ──
 pyaudio>=0.2.14
-sounddevice>=0.4.6
 numpy>=1.24.0
-scipy>=1.10.0
 
 # ── Camera & Vision ──
 opencv-python-headless>=4.8.0
-Pillow>=10.0.0
 
 # ── TFLite Runtime (for Raspberry Pi) ──
+# NOTE: Official PyPI wheels may not cover all RPi / Python combos.
+# If `pip install tflite-runtime` fails, try the Coral repo:
+#   pip install --index-url https://google-coral.github.io/py-repo/ tflite_runtime
 tflite-runtime>=2.14.0
 
 # ── Face Display ──
@@ -30,6 +30,3 @@ pygame>=2.5.0
 
 # ── Environment variables ──
 python-dotenv>=1.0.0
-
-# ── Utilities ──
-threading-timer-decorator>=1.0.0
