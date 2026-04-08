@@ -101,6 +101,13 @@ class FaceDisplay:
         self._is_talking = False
         self._talk_amplitude = 0.0       # Smoothed amplitude for natural talking
 
+        # ── Robot state overlay (listening / thinking / None) ──
+        # When set, draws a subtle visual indicator so the user knows what ECHO is doing.
+        # "listening" = attentive eyes (slightly wider), pulsing ear indicator
+        # "thinking"  = eyes drift upward, processing dot animation
+        self._state = None               # None, "listening", or "thinking"
+        self._state_phase = 0.0          # Animation phase for state indicators
+
         # ── Breathing ──
         self._breath_phase = 0.0
 
@@ -223,6 +230,18 @@ class FaceDisplay:
         with self._lock:
             self._is_talking = talking
 
+    def set_state(self, state):
+        """Set the robot's current activity state for visual feedback.
+        Args:
+            state: "listening", "thinking", or None (normal).
+        When "listening": eyes widen slightly, subtle pulse indicator.
+        When "thinking": eyes drift up, animated processing dots.
+        When None: normal face behavior resumes."""
+        with self._lock:
+            if state != self._state:
+                self._state = state
+                self._state_phase = 0.0  # Reset animation
+
     def set_gaze(self, x: float, y: float):
         """Direct the pupils toward a point.
         x: -1.0 (far left) to 1.0 (far right)
@@ -310,6 +329,7 @@ class FaceDisplay:
         with self._lock:
             target_emotion = self._target_emotion
             is_talking = self._is_talking
+            state = self._state
 
         # ── Smooth emotion transition ──
         if self._emotion_blend < 1.0:
@@ -412,6 +432,20 @@ class FaceDisplay:
 
         # ── Idle micro-movement ──
         self._idle_phase += dt * 0.7
+
+        # ── State-based pupil overrides (listening/thinking) ──
+        if state == "thinking":
+            # Thinking: eyes drift upward and slightly to the side (looking up = thinking)
+            self._state_phase += dt
+            think_drift_y = -self.EYE_RADIUS * 0.18  # Look up
+            think_drift_x = math.sin(self._state_phase * 1.5) * self.EYE_RADIUS * 0.06  # Subtle side drift
+            self._pupil_target_x = think_drift_x
+            self._pupil_target_y = think_drift_y
+        elif state == "listening":
+            # Listening: pupils center and slightly widen (attentive)
+            self._state_phase += dt
+            self._pupil_target_x = 0.0
+            self._pupil_target_y = 0.0
 
         # ── Reaction animation decay ──
         if self._reaction_timer > 0:
@@ -518,6 +552,47 @@ class FaceDisplay:
                 pygame.draw.ellipse(self._screen, tear_col,
                                    (tear_x - 3, tear_y, 6, 10))
 
+        # ── State indicators (listening/thinking visual cues) ──
+        with self._lock:
+            state = self._state
+            state_phase = self._state_phase
+
+        if state == "thinking":
+            # Animated processing dots below the mouth
+            dot_y = mouth_y + int(self.MOUTH_H * 1.8)
+            dot_spacing = 22
+            num_dots = 3
+            start_x = mouth_x - (num_dots - 1) * dot_spacing // 2
+            for i in range(num_dots):
+                # Each dot pulses at a different phase (staggered wave)
+                pulse = (math.sin(state_phase * 4.0 - i * 0.8) + 1.0) * 0.5  # 0.0 to 1.0
+                dot_r = int(3 + pulse * 4)
+                dot_alpha_frac = 0.3 + pulse * 0.7
+                dot_col = (max(0, int(accent[0] * dot_alpha_frac)),
+                           max(0, int(accent[1] * dot_alpha_frac)),
+                           max(0, int(accent[2] * dot_alpha_frac)))
+                pygame.draw.circle(self._screen, dot_col,
+                                   (start_x + i * dot_spacing, dot_y), dot_r)
+
+        elif state == "listening":
+            # Pulsing "ear" arcs on the sides of the face (attentive indicator)
+            pulse = (math.sin(state_phase * 3.0) + 1.0) * 0.5
+            ear_alpha_frac = 0.15 + pulse * 0.35
+            ear_col = (max(0, int(accent[0] * ear_alpha_frac)),
+                       max(0, int(accent[1] * ear_alpha_frac)),
+                       max(0, int(accent[2] * ear_alpha_frac)))
+            # Left ear arc
+            ear_r = int(self.EYE_RADIUS * 0.6)
+            left_ear_x = self.LEFT_EYE_X - int(self.EYE_RADIUS * 1.6)
+            right_ear_x = self.RIGHT_EYE_X + int(self.EYE_RADIUS * 1.6)
+            ear_y = int(self.EYE_Y + breath)
+            ear_rect_l = (left_ear_x - ear_r, ear_y - ear_r, ear_r * 2, ear_r * 2)
+            ear_rect_r = (right_ear_x - ear_r, ear_y - ear_r, ear_r * 2, ear_r * 2)
+            pygame.draw.arc(self._screen, ear_col, ear_rect_l,
+                           -math.pi * 0.4, math.pi * 0.4, 3)
+            pygame.draw.arc(self._screen, ear_col, ear_rect_r,
+                           math.pi * 0.6, math.pi * 1.4, 3)
+
         # ── Pre-rendered scan lines overlay ON TOP for holographic effect ──
         if self._scan_overlay is not None:
             self._screen.blit(self._scan_overlay, (0, 0))
@@ -526,7 +601,11 @@ class FaceDisplay:
         try:
             font = self._status_font
             status = f"ECHO  |  {emotion.upper()}"
-            if is_talking:
+            if state == "thinking":
+                status += "  |  THINKING"
+            elif state == "listening":
+                status += "  |  LISTENING"
+            elif is_talking:
                 status += "  |  SPEAKING"
             label = font.render(status, True, dim_accent)
             self._screen.blit(label, (self.W // 2 - label.get_width() // 2, self.H - 24))

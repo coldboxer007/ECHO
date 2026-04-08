@@ -116,7 +116,7 @@ The robot understands natural language, sees facial emotions via camera, respond
 
 ```
 User speaks → Mic captures audio (PyAudio @ 44100Hz)
-   → Silence detection stops recording (0.7s silence threshold)
+   → Silence detection stops recording (0.5s silence threshold)
    → Faster-Whisper tiny.en transcribes (in-memory float32 array, no temp file)
    → Hallucination filter strips known Whisper artifacts ("thank you for watching", etc.)
    → Wake word gate (optional — strips "Echo"/"Hey Echo" prefix, discards non-matching)
@@ -134,11 +134,15 @@ User speaks → Mic captures audio (PyAudio @ 44100Hz)
       ├─ Volume → Adjusts TTS playback volume (louder/quieter)
       ├─ Clear history → Resets conversation memory
       └─ Chat → Gemini 2.5 Flash streams response sentence-by-sentence
+               → FaceDisplay set_state("listening") during mic capture
                → play_thinking_cue() (440Hz→660Hz beep, ~200ms, direct PyAudio playback)
+               → FaceDisplay set_state("thinking") while waiting for Gemini
                → think_stream() yields sentences as they complete (splits on . ! ? and \\n)
                → determine_response_emotion() picks face emotion from first sentence
                → FaceDisplay shows emotion (shape-morphing transition)
-               → Gemini TTS streams each sentence (with volume control)
+               → Producer-consumer TTS pipeline: producer thread generates TTS audio
+                 for sentence N+1 while consumer plays sentence N (queue-based, maxsize=4)
+               → Mouth sync via callback: _notify_talking(True/False) fires when audio plays/stops
                → pw-play outputs through USB speaker
   → Face gaze tracks detected face position (set_gaze from camera)
 ```
@@ -314,7 +318,7 @@ The loop skips listening while the robot is speaking (to avoid hearing its own v
 
 1. **Microphone capture:** PyAudio opens the USB mic at its native sample rate (44100Hz for Zeb SoundMX through PipeWire). Records in 1024-sample chunks.
 
-2. **Silence detection:** Each chunk's RMS energy is computed. If RMS > 150 (configurable threshold), it's considered speech. Recording stops after 0.7 seconds of silence following speech (reduced from 1.0s for snappier response), or after 8 seconds maximum.
+2. **Silence detection:** Each chunk's RMS energy is computed. If RMS > 150 (configurable threshold), it's considered speech. Recording stops after 0.5 seconds of silence following speech (reduced from 0.7s for snappier response), or after 8 seconds maximum.
 
 3. **Whisper transcription:** The recorded PCM audio is converted to a float32 numpy array in memory and passed directly to Faster-Whisper (no temp WAV file I/O). If the source sample rate differs from 16kHz, it is resampled using scipy sinc interpolation (falls back to numpy linear interpolation if scipy is unavailable). Falls back to temp WAV file if in-memory transcription fails. Settings:
    - Model: `tiny.en` (39MB — chosen for speed on RPi4 CPU, ~2-3s per transcription)
@@ -349,7 +353,7 @@ The brain has multiple functions:
 
 3. **Conversation — blocking** (`think`): Sends the user's text + detected emotion to Gemini 2.5 Flash and returns the complete response. Used as fallback when streaming is not needed.
 
-4. **Conversation — streaming** (`think_stream`): Generator that yields response sentences as they complete from Gemini. Uses `_SENTENCE_RE` regex to split on sentence boundaries (`.`, `!`, `?`, `\n`). Enables the streaming think→TTS pipeline where the first sentence is spoken while subsequent ones are still generating. Conversation history is capped at 20 entries (10 exchanges) to keep API calls lean.
+4. **Conversation — streaming** (`think_stream`): Generator that yields response sentences as they complete from Gemini. Uses `_SENTENCE_RE` regex to split on sentence boundaries (`.`, `!`, `?`, `\n`). Enables the streaming think→TTS pipeline where the first sentence is spoken while subsequent ones are still generating. Conversation history is capped at 30 entries (15 exchanges) to keep API calls lean while providing enough context for coherent multi-turn dialogue.
 
 5. **Scene analysis** (`analyze_scene`): Sends a camera frame JPEG to Gemini vision for description. Triggered by "what do you see", "look around", etc.
 
@@ -366,16 +370,20 @@ The brain has multiple functions:
    - Emotion direction prepended (e.g., "Say this warmly and cheerfully with a smile in your voice:")
    - Output: raw PCM audio at 24kHz
 
-2. **Thinking audio cue:** Before streaming begins, `play_thinking_cue()` generates a brief ascending two-tone beep (440Hz → 660Hz, ~200ms) using direct PyAudio playback (no temp file or subprocess overhead). Falls back to `_play_audio_bytes` if direct PyAudio fails. Lets the user know ECHO heard them and is processing.
+2. **Producer-consumer TTS pipeline:** In `_handle_chat`, a producer thread reads sentences from `think_stream()` and calls `generate_tts_audio()` to pre-generate audio bytes for each sentence. These are placed into a `queue.Queue(maxsize=4)`. The consumer (main thread) pulls from the queue and plays each sentence via `play_audio()`. This overlaps TTS generation for sentence N+1 with playback of sentence N, saving 1-3 seconds per sentence after the first.
 
-3. **Volume boost + user volume:** The returned audio gets a base +6dB boost (x2.0 amplitude) because Gemini TTS output tends to be quiet. On top of this, a user-adjustable volume multiplier (0.25x – 2.0x) is applied. Volume can be adjusted by voice ("louder", "volume up", "quieter", "volume down") in 25% steps.
+3. **Mouth sync callback:** `SpeechEngine` fires a `_on_talking_changed` callback when audio actually starts/stops playing. `_notify_talking(True, duration)` is called in `_play_audio_bytes()` before playback begins, and `_notify_talking(False, 0.0)` after playback ends. The main ECHO class registers a callback that calls `face.set_talking()`, ensuring mouth animation is perfectly synchronized with actual audio output rather than being estimated.
 
-3. **Playback:** Audio is written to a temp WAV file and played via:
+4. **Thinking audio cue:** Before streaming begins, `play_thinking_cue()` generates a brief ascending two-tone beep (440Hz → 660Hz, ~200ms) using direct PyAudio playback (no temp file or subprocess overhead). Falls back to `_play_audio_bytes` if direct PyAudio fails. Lets the user know ECHO heard them and is processing.
+
+5. **Volume boost + user volume:** The returned audio gets a base +6dB boost (x2.0 amplitude) because Gemini TTS output tends to be quiet. On top of this, a user-adjustable volume multiplier (0.25x – 2.0x) is applied. Volume can be adjusted by voice ("louder", "volume up", "quieter", "volume down") in 25% steps.
+
+6. **Playback:** Audio is written to a temp WAV file and played via:
    - **Primary:** `pw-play` (PipeWire native — most reliable on RPi with PipeWire)
    - **Fallback 1:** `aplay` (ALSA)
    - **Fallback 2:** PyAudio stream (last resort)
 
-4. **Espeak fallback:** If Gemini TTS fails entirely, `espeak` generates offline speech, piped through `pw-play`.
+7. **Espeak fallback:** If Gemini TTS fails entirely, `espeak` generates offline speech, piped through `pw-play`.
 
 > **Why not PyAudio for playback?** On RPi with PipeWire, PyAudio playback was silent — PipeWire's ALSA compatibility layer didn't route PyAudio's output to the USB speaker. Subprocess-based `pw-play` communicates directly with PipeWire's native protocol and works reliably.
 
@@ -443,6 +451,9 @@ A full-screen pygame animation running at 20fps on the HDMI display:
 - **Pupil wandering:** Pupils drift randomly with lerp smoothing during idle (overridden by gaze tracking when active)
 - **Breathing animation:** Subtle vertical oscillation of eye positions
 - **Talk animation:** Multi-frequency mouth movement (3 layered sine waves) when speaking
+- **Listening state indicator:** When ECHO is listening for voice input, `set_state("listening")` activates pulsing ear arc indicators on the sides of the face and centers the pupils for an attentive look
+- **Thinking state indicator:** When ECHO is processing/waiting for Gemini, `set_state("thinking")` drifts the eyes upward and shows animated processing dots (3 staggered pulsing dots) below the mouth
+- **Status bar:** Shows current state (LISTENING/THINKING/SPEAKING) at the bottom of the display
 - **Idle micro-movements:** Gentle sway when neutral
 
 **Performance optimizations:**
@@ -510,7 +521,9 @@ Priority 6: Utility commands
 
 Priority 7: Chat (default)
     └─ Everything else → sent to Gemini for conversation
-        BUT FIRST: interpret_command_nlp() asks Gemini to classify
+        BUT FIRST: NLP skip heuristic checks if phrase is obvious chat
+        (>6 words, starts with question word, contains '?')
+        If ambiguous: interpret_command_nlp() asks Gemini to classify
         the phrase as a movement command (catches "come ahead",
         "move closer", etc. that keywords miss)
 ```
@@ -922,6 +935,21 @@ When TFLite is unavailable, ECHO falls back to `analyze_emotion_from_image()` (G
 ### 21. NLP classification caching
 The hybrid NLP fallback (`interpret_command_nlp`) calls Gemini to classify ambiguous phrases. If the user repeats or the system re-processes the same text within 2 seconds, the cached result is returned instantly instead of making another API call. Reduces redundant Gemini calls during rapid interaction.
 
+### 22. Producer-consumer TTS pipeline
+Instead of generating TTS audio for a sentence and then playing it sequentially, Round 6 introduced a queue-based producer-consumer pattern. A background producer thread reads sentences from `think_stream()` and pre-generates TTS audio via `generate_tts_audio()`, placing results into a bounded queue (maxsize=4). The main thread consumes from the queue, playing each sentence. This overlaps generation of sentence N+1 with playback of sentence N, saving 1-3 seconds per sentence after the first. A sentinel `None` value signals stream exhaustion, and a 30-second timeout prevents deadlocks.
+
+### 23. Mouth sync via callback
+Previously, mouth animation (`set_talking(True/False)`) was called manually in the chat handler based on rough timing estimates. Round 6 replaced this with a callback system in `SpeechEngine`: `_notify_talking(True, duration)` fires when `_play_audio_bytes()` actually begins playback, and `_notify_talking(False, 0.0)` fires when it ends. The ECHO class registers `_on_talking_changed` which calls `face.set_talking()`. This ensures perfect synchronization between mouth movement and actual audio output.
+
+### 24. NLP skip heuristic for obvious chat
+The hybrid NLP fallback called Gemini to classify every `chat`-type phrase, adding 1-2 seconds of latency even for obviously conversational input like "How are you doing today?". Round 6 added a heuristic: if the phrase has >6 words, starts with a question word (who/what/where/when/why/how), or contains a question mark, or contains chat indicator words (feel/think/tell/know), the NLP API call is skipped entirely. This saves 1-2 seconds on the vast majority of conversational interactions.
+
+### 25. Listening and thinking face states
+The face display now has explicit state indicators beyond just emotions. `set_state("listening")` shows pulsing ear arc indicators and centers the pupils for an attentive look. `set_state("thinking")` drifts the eyes upward and shows animated processing dots below the mouth. These states provide clear visual feedback about what ECHO is doing, replacing the previous approach of abusing `set_talking(True)` as a "thinking" indicator.
+
+### 26. Simplified message format for Gemini
+The message format sent to Gemini was changed from `[EMOTION DETECTED: X (confidence: Y%)]\nUser says: Z` to simply `[EMOTION: X] Z`. This saves tokens on every API call, reduces prompt noise, and provides clearer context for the model without unnecessary verbosity.
+
 ---
 
 ## Future Directions
@@ -987,6 +1015,18 @@ The hybrid NLP fallback (`interpret_command_nlp`) calls Gemini to classify ambig
 29. ~~**Emotion Fallback Rate-Limiting**~~ — **DONE (Round 5).** Gemini API emotion fallback (used when TFLite is unavailable) now rate-limited to once per 10 seconds instead of every listen cycle. Prevents unnecessary API calls and reduces latency. Applied to both main.py and debug_main.py.
 
 30. ~~**Audio Chunk Duration Increase**~~ — **DONE (Round 5).** `AUDIO_CHUNK_DURATION` increased from 5 to 8 seconds. The previous 5-second limit was truncating longer sentences mid-speech.
+
+31. ~~**Producer-Consumer TTS Pipeline**~~ — **DONE (Round 6).** Queue-based producer-consumer pattern in `_handle_chat`. Producer thread pre-generates TTS audio for upcoming sentences while the current sentence plays. Overlaps generation with playback, saving 1-3 seconds per sentence after the first. Bounded queue (maxsize=4) with sentinel-based termination.
+
+32. ~~**Mouth Sync Callback System**~~ — **DONE (Round 6).** Replaced manual `set_talking(True/False)` calls with a callback system in `SpeechEngine`. `_notify_talking()` fires when audio actually starts/stops playing in `_play_audio_bytes()`, ensuring mouth animation is perfectly synchronized with real audio output.
+
+33. ~~**Listening & Thinking Face States**~~ — **DONE (Round 6).** `set_state("listening")` shows pulsing ear arcs and attentive centered pupils. `set_state("thinking")` drifts eyes upward with animated processing dots below the mouth. Provides clear visual feedback during the listen→think→speak pipeline.
+
+34. ~~**NLP Skip Heuristic**~~ — **DONE (Round 6).** Added fast heuristic to skip the Gemini NLP classification API call for obviously conversational input (>6 words, question words, '?' present, chat indicator words). Saves 1-2 seconds on most chat interactions.
+
+35. ~~**Conversation Quality Improvements**~~ — **DONE (Round 6).** History increased from 20→30 entries (15 exchanges) for better multi-turn context. Message format simplified from verbose `[EMOTION DETECTED: X (confidence: Y%)]\nUser says: Z` to `[EMOTION: X] Z`. System prompt rewritten with clearer persona and conversation guidelines.
+
+36. ~~**Silence Duration Reduction**~~ — **DONE (Round 6).** `AUDIO_SILENCE_DURATION` reduced from 0.7s to 0.5s for faster response after the user finishes speaking.
 
 ### Known Limitations
 

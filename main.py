@@ -20,6 +20,7 @@ import time
 import signal
 import logging
 import threading
+import queue
 
 # ─── Logging Setup ───
 logging.basicConfig(
@@ -83,9 +84,14 @@ class ECHO:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
+        # ── Wire up mouth sync callback ──
+        # When speech_engine starts/stops playing audio, it fires this callback
+        # so the face display can precisely track when the mouth should move.
+        self.speech.set_talking_callback(self._on_talking_changed)
+
         # Safety: ensure all motors are stopped before starting
         self.motors.stop()
-        logger.info("✅ All subsystems initialized!")
+        logger.info("All subsystems initialized!")
 
     def start(self):
         """Start all background services and enter the main loop."""
@@ -133,7 +139,9 @@ class ECHO:
                     continue
 
                 # ── Step 1: Listen ──
+                self.face.set_state("listening")
                 user_text = self.speech.listen()
+                self.face.set_state(None)
 
                 if not user_text:
                     time.sleep(0.1)
@@ -194,11 +202,27 @@ class ECHO:
                 command = self.brain.interpret_command(user_text)
 
                 if command['type'] == 'chat':
-                    # Hybrid NLP: ask Gemini if this is a movement command
-                    nlp_command = self.brain.interpret_command_nlp(user_text)
-                    if nlp_command['type'] != 'chat':
-                        command = nlp_command
-                        logger.info(f"🧠 NLP reclassified '{user_text}' → {command['type']}")
+                    # Hybrid NLP: ask Gemini only for SHORT ambiguous phrases
+                    # that might be natural-language movement commands.
+                    # Skip NLP for obvious conversation (questions, long sentences)
+                    # to save 1-2s of API latency per interaction.
+                    words = user_text.split()
+                    text_lower_strip = user_text.lower().strip()
+                    _CHAT_INDICATORS = {'what', 'why', 'how', 'when', 'where', 'who',
+                                        'tell', 'explain', 'think', 'feel', 'know',
+                                        'like', 'love', 'hate', 'want', 'need',
+                                        'can you', 'do you', 'are you', 'is it',
+                                        'have you', "what's", "how's", "who's"}
+                    is_likely_chat = (
+                        len(words) > 6  # Long sentences are almost never movement
+                        or any(text_lower_strip.startswith(w) for w in _CHAT_INDICATORS)
+                        or '?' in user_text  # Questions are conversation
+                    )
+                    if not is_likely_chat:
+                        nlp_command = self.brain.interpret_command_nlp(user_text)
+                        if nlp_command['type'] != 'chat':
+                            command = nlp_command
+                            logger.info(f"🧠 NLP reclassified '{user_text}' → {command['type']}")
 
                 logger.info(f"🎯 Command type: {command['type']}")
 
@@ -339,16 +363,14 @@ class ECHO:
             self.face.set_emotion("neutral")
             return
 
-        self.face.set_talking(True)  # Thinking indicator
+        self.face.set_state("thinking")  # Thinking indicator while analyzing
         description = self.brain.analyze_scene(frame_jpeg)
-        self.face.set_talking(False)
+        self.face.set_state(None)
 
         if description:
             response_emotion = self.brain.determine_response_emotion(description, "neutral")
             self.face.set_emotion(response_emotion)
-            self.face.set_talking(True)
             self.speech.speak(description, emotion=response_emotion)
-            self.face.set_talking(False)
         else:
             self.speech.speak("I looked but I'm having trouble describing what I see.", emotion="neutral")
 
@@ -368,52 +390,106 @@ class ECHO:
         logger.info(f"Volume adjusted {direction}: {new_vol:.2f}x ({pct}%)")
 
     def _handle_chat(self, user_text: str, emotion: str, confidence: float):
-        """Handle conversational input with streaming think→TTS pipeline.
-        Speaks the first sentence while Gemini continues generating the rest,
-        reducing perceived latency by 1-3 seconds."""
+        """Handle conversational input with pipelined think→TTS→play pipeline.
+
+        Architecture (producer-consumer pattern):
+        1. Show "thinking" face state + play audio cue
+        2. Producer thread: reads sentences from Gemini stream, generates TTS
+           audio for each, and puts (sentence, audio_bytes, rate) into a queue
+        3. Consumer (this thread): pulls from queue and plays audio in order
+        4. Mouth animation is synced to actual audio playback via callback
+
+        Because TTS generation (~1-3s) overlaps with audio playback (~1-3s),
+        sentences after the first play with near-zero gap between them.
+        """
         # Show detected user emotion while thinking
         self.face.set_emotion(emotion)
 
-        # "Thinking" indicator — show on face while waiting for Gemini (1-3s gap)
-        self.face.set_talking(True)  # Subtle visual cue that ECHO is processing
+        # "Thinking" state — distinct from talking (eyes look up, processing look)
+        self.face.set_state("thinking")
 
         # Play brief audio cue so user knows ECHO heard them
         self.speech.play_thinking_cue()
 
-        # Stream Gemini response sentence-by-sentence
+        # ── Producer-consumer TTS pipeline ──
+        # Queue holds: (sentence, audio_bytes, sample_rate) or None as sentinel
+        tts_queue = queue.Queue(maxsize=4)
+        response_emotion_ref = [emotion]  # Mutable ref so producer can read consumer's update
+
+        def _tts_producer():
+            """Read sentences from Gemini stream, generate TTS, enqueue results."""
+            first = True
+            try:
+                for sentence in self.brain.think_stream(user_text, emotion, confidence):
+                    if first:
+                        # Determine response emotion from first sentence
+                        resp_emo = self.brain.determine_response_emotion(sentence, emotion)
+                        response_emotion_ref[0] = resp_emo
+
+                    # Generate TTS audio (this is the expensive step: 1-3s)
+                    audio_bytes, audio_rate = self.speech.generate_tts_audio(
+                        sentence, emotion=response_emotion_ref[0]
+                    )
+                    tts_queue.put((sentence, audio_bytes, audio_rate, first))
+                    first = False
+            except Exception as e:
+                logger.error(f"TTS producer error: {e}")
+            finally:
+                tts_queue.put(None)  # Sentinel: stream exhausted
+
+        # Start producer thread
+        producer = threading.Thread(target=_tts_producer, daemon=True)
+        producer.start()
+
+        # ── Consumer: play audio in order ──
         full_response = ""
         first_sentence = True
-        response_emotion = emotion  # Default to user emotion until first sentence determines it
+        response_emotion = emotion
 
-        for sentence in self.brain.think_stream(user_text, emotion, confidence):
-            if first_sentence:
-                self.face.set_talking(False)  # Stop thinking indicator
+        while True:
+            try:
+                item = tts_queue.get(timeout=30)  # 30s timeout for safety
+            except queue.Empty:
+                logger.warning("TTS pipeline timeout — no more sentences after 30s")
+                break
+
+            if item is None:
+                # Sentinel — stream exhausted
+                break
+
+            sentence, audio_bytes, audio_rate, is_first = item
+
+            if is_first and first_sentence:
+                self.face.set_state(None)  # Clear thinking state
                 first_sentence = False
-
-                # Determine response emotion from first sentence
-                response_emotion = self.brain.determine_response_emotion(sentence, emotion)
+                response_emotion = response_emotion_ref[0]
                 logger.info(f"Response emotion: {response_emotion}")
                 self.face.set_emotion(response_emotion)
 
             full_response += sentence + " "
 
-            # Speak each sentence as it arrives
-            self.face.set_talking(True)
-            self.speech.speak(sentence, emotion=response_emotion)
+            if audio_bytes:
+                # Play pre-generated audio (mouth sync handled by callback)
+                logger.info(f"Playing TTS: '{sentence[:50]}...'")
+                self.speech.play_audio(audio_bytes, audio_rate)
+            else:
+                # TTS generation failed — fall back to synchronous speak
+                logger.warning(f"TTS pipeline miss, falling back: '{sentence[:40]}...'")
+                self.speech.speak(sentence, emotion=response_emotion)
+
+        # Wait for producer to finish
+        producer.join(timeout=5)
 
         # If no sentences came through (empty response)
         if not full_response.strip():
-            self.face.set_talking(False)
+            self.face.set_state(None)
             response = "Hmm, I'm not sure what to say about that."
             response_emotion = "neutral"
             self.face.set_emotion(response_emotion)
-            self.face.set_talking(True)
             self.speech.speak(response, emotion=response_emotion)
 
-        # Stop talking animation
+        # Ensure mouth stops and face returns to neutral
         self.face.set_talking(False)
-
-        # Return face to a gentle neutral after speaking
         time.sleep(0.5)
         self.face.set_emotion("neutral")
 
@@ -425,6 +501,12 @@ class ECHO:
         """Handle Ctrl+C and SIGTERM gracefully."""
         logger.info(f"Signal {signum} received — shutting down...")
         self._running = False
+
+    def _on_talking_changed(self, talking: bool, duration: float = 0.0):
+        """Mouth sync callback from SpeechEngine.
+        Called when audio playback starts (talking=True, duration=seconds)
+        and when it ends (talking=False)."""
+        self.face.set_talking(talking)
 
     def shutdown(self):
         """Clean up all subsystems."""

@@ -291,7 +291,9 @@ class ECHODebug(ECHO):
 
                 # ── Step 1: Listen ──
                 dp("LISTEN", "🎤 Waiting for speech...", C_YELLOW)
+                self.face.set_state("listening")
                 user_text = self.speech.listen()
+                self.face.set_state(None)
 
                 if not user_text:
                     dp("LISTEN", "(silence — no speech detected)", C_DIM)
@@ -357,13 +359,30 @@ class ECHODebug(ECHO):
                 cmd_type = command['type']
 
                 # Hybrid NLP: if local match returns 'chat', try Gemini NLP
-                # classification for natural language movement phrases
+                # classification for natural language movement phrases.
+                # Skip NLP for obvious conversation to save 1-2s of API latency.
                 if cmd_type == 'chat':
-                    nlp_command = self.brain.interpret_command_nlp(user_text)
-                    if nlp_command['type'] != 'chat':
-                        command = nlp_command
-                        cmd_type = command['type']
-                        dp("NLP", f"🧠 Reclassified '{user_text}' → {cmd_type}", C_GREEN)
+                    words = user_text.split()
+                    text_lower_strip = user_text.lower().strip()
+                    _CHAT_INDICATORS = {'what', 'why', 'how', 'when', 'where', 'who',
+                                        'tell', 'explain', 'think', 'feel', 'know',
+                                        'like', 'love', 'hate', 'want', 'need',
+                                        'can you', 'do you', 'are you', 'is it',
+                                        'have you', "what's", "how's", "who's"}
+                    is_likely_chat = (
+                        len(words) > 6
+                        or any(text_lower_strip.startswith(w) for w in _CHAT_INDICATORS)
+                        or '?' in user_text
+                    )
+                    if is_likely_chat:
+                        dp("NLP", f"Skipping NLP — obvious conversation ({len(words)} words)", C_DIM)
+                    else:
+                        dp("NLP", f"Short ambiguous phrase — trying Gemini NLP...", C_YELLOW)
+                        nlp_command = self.brain.interpret_command_nlp(user_text)
+                        if nlp_command['type'] != 'chat':
+                            command = nlp_command
+                            cmd_type = command['type']
+                            dp("NLP", f"🧠 Reclassified '{user_text}' → {cmd_type}", C_GREEN)
 
                 cmd_dir = command.get('direction', '')
                 dp("COMMAND", f"Type: {cmd_type}" + (f" → {cmd_dir}" if cmd_dir else ""), C_MAGENTA)
@@ -490,8 +509,8 @@ class ECHODebug(ECHO):
         dp("BRAIN", f"  Input: \"{user_text}\"", C_MAGENTA)
         dp("BRAIN", f"  Emotion context: {emotion} ({confidence:.0%})", C_MAGENTA)
 
-        # "Thinking" indicator
-        self.face.set_talking(True)
+        # "Thinking" state — distinct visual/audio indicator
+        self.face.set_state("thinking")
 
         # Play brief audio cue so user knows ECHO heard them
         self.speech.play_thinking_cue()
@@ -506,7 +525,7 @@ class ECHODebug(ECHO):
         for sentence in self.brain.think_stream(user_text, emotion, confidence):
             sentence_count += 1
             if first_sentence:
-                self.face.set_talking(False)  # Stop thinking indicator
+                self.face.set_state(None)  # Clear thinking state
                 first_sentence = False
 
                 # Determine response emotion from first sentence
@@ -517,25 +536,24 @@ class ECHODebug(ECHO):
             full_response += sentence + " "
             dp("STREAM", f"  [{sentence_count}] \"{sentence}\"", C_GREEN)
 
-            # Speak each sentence as it arrives
-            self.face.set_talking(True)
+            # Speak each sentence as it arrives (mouth sync handled by callback)
             self.speech.speak(sentence, emotion=response_emotion)
             self._speak_count += 1
 
         # If no sentences came through (empty response)
         if not full_response.strip():
-            self.face.set_talking(False)
+            self.face.set_state(None)
             full_response = "Hmm, I'm not sure what to say about that."
             response_emotion = "neutral"
             dp("BRAIN", "⚠️  No response from Gemini, using default", C_YELLOW)
             self.face.set_emotion(response_emotion)
-            self.face.set_talking(True)
             self.speech.speak(full_response, emotion=response_emotion)
             self._speak_count += 1
 
         dp("OUTPUT", f"🤖 ECHO says: \"{full_response.strip()}\"", C_GREEN)
         dp("STREAM", f"Total sentences streamed: {sentence_count}", C_DIM)
 
+        # Ensure mouth stops and face returns to neutral
         self.face.set_talking(False)
         time.sleep(0.5)
         self.face.set_emotion("neutral")

@@ -87,6 +87,15 @@ class SpeechEngine:
         self._volume = 1.0  # Volume multiplier: 0.25 (quiet) to 2.0 (loud), default 1.0
         self._lock = threading.Lock()
 
+        # ── Mouth sync callback ──
+        # When set, called with (talking: bool, duration: float) so the face
+        # can precisely track when audio is actually playing.
+        self._on_talking_changed = None  # Callable[[bool, float], None]
+
+        # ── TTS pipelining ──
+        # Pre-generate TTS audio in a background thread while current audio plays.
+        self._tts_queue = None  # Will use queue.Queue for pipeline
+
         self._init_stt()
         self._init_tts()
         self._init_audio()
@@ -655,6 +664,7 @@ class SpeechEngine:
         Play raw PCM audio bytes through speakers.
         Uses subprocess-based playback (pw-play / aplay) for reliability
         on RPi with PipeWire. Falls back to PyAudio if neither is available.
+        Fires talking callbacks for mouth sync.
         """
         if not audio_bytes:
             logger.warning("No audio data to play")
@@ -674,6 +684,9 @@ class SpeechEngine:
         except Exception:
             pass  # Play original if boost fails
 
+        # Calculate duration for mouth sync
+        duration = len(audio_bytes) / (sample_rate * 2)  # 2 bytes per sample, mono
+
         # Write PCM data to a temporary WAV file
         tmp_wav = os.path.join(tempfile.gettempdir(), "echo_tts_out.wav")
         try:
@@ -687,8 +700,10 @@ class SpeechEngine:
             return
 
         file_size = os.path.getsize(tmp_wav)
-        duration = len(audio_bytes) / (sample_rate * 2)  # 2 bytes per sample, mono
         logger.info(f"Playing {duration:.1f}s audio ({file_size} bytes) @ {sample_rate} Hz")
+
+        # ── Notify mouth sync: talking starts ──
+        self._notify_talking(True, duration)
 
         # Try pw-play first (PipeWire native, most reliable)
         played = False
@@ -743,6 +758,9 @@ class SpeechEngine:
                     except Exception:
                         pass
 
+        # ── Notify mouth sync: talking ends ──
+        self._notify_talking(False, 0.0)
+
         if not played:
             logger.error("All audio playback methods failed!")
 
@@ -752,10 +770,93 @@ class SpeechEngine:
         except Exception:
             pass
 
+    def generate_tts_audio(self, text: str, emotion: str = "neutral") -> tuple:
+        """Generate TTS audio without playing it. Returns (audio_bytes, sample_rate)
+        or (None, 0) on failure. Used for TTS pipelining — generate audio for
+        the next sentence while the current one is still playing."""
+        if not text or self._genai_client is None:
+            return None, 0
+
+        emotion_directions = {
+            "happy":    "Say this warmly and cheerfully with a smile in your voice:",
+            "sad":      "Say this gently and softly with empathy:",
+            "angry":    "Say this in a calm, reassuring tone:",
+            "surprise": "Say this with gentle excitement and wonder:",
+            "fear":     "Say this in a warm, comforting and reassuring way:",
+            "disgust":  "Say this calmly and matter-of-factly:",
+            "neutral":  "Say this in a friendly, conversational tone:",
+        }
+        direction = emotion_directions.get(emotion, emotion_directions["neutral"])
+        prompt = f"{direction}\n\"{text}\""
+
+        try:
+            response_stream = self._genai_client.models.generate_content_stream(
+                model=GEMINI_TTS_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=TTS_VOICE,
+                            )
+                        )
+                    ),
+                ),
+            )
+
+            audio_chunks = []
+            for chunk in response_stream:
+                if (chunk.candidates and chunk.candidates[0].content
+                        and chunk.candidates[0].content.parts):
+                    for part in chunk.candidates[0].content.parts:
+                        if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
+                            audio_chunks.append(part.inline_data.data)
+
+            if audio_chunks:
+                return b"".join(audio_chunks), TTS_SAMPLE_RATE
+            return None, 0
+
+        except Exception as e:
+            logger.error(f"TTS audio generation error: {e}")
+            return None, 0
+
+    def play_audio(self, audio_bytes: bytes, sample_rate: int):
+        """Play pre-generated audio bytes through speakers.
+        Sets is_speaking flag and fires mouth sync callbacks."""
+        if not audio_bytes:
+            return
+
+        with self._lock:
+            self._is_speaking = True
+
+        try:
+            self._play_audio_bytes(audio_bytes, sample_rate)
+        except Exception as e:
+            logger.error(f"Audio playback error: {e}")
+        finally:
+            with self._lock:
+                self._is_speaking = False
+
     @property
     def is_speaking(self) -> bool:
         with self._lock:
             return self._is_speaking
+
+    def set_talking_callback(self, callback):
+        """Register a callback for mouth sync: callback(talking: bool, duration: float).
+        Called with (True, estimated_duration) when audio playback starts,
+        and (False, 0.0) when playback ends."""
+        self._on_talking_changed = callback
+
+    def _notify_talking(self, talking: bool, duration: float = 0.0):
+        """Fire the talking callback if registered."""
+        cb = self._on_talking_changed
+        if cb:
+            try:
+                cb(talking, duration)
+            except Exception as e:
+                logger.debug(f"Talking callback error: {e}")
 
     def play_thinking_cue(self):
         """Play a brief 'thinking' tone to fill the silence while Gemini processes.

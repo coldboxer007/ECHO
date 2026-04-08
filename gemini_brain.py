@@ -39,9 +39,9 @@ class GeminiBrain:
     """Gemini-powered conversational AI with emotion awareness."""
 
     # Maximum chat history entries to keep in memory (pairs of user+model)
-    # 20 entries = 10 exchanges — enough context for conversation continuity
-    # while keeping API request size manageable on RPi (fewer tokens = faster response)
-    MAX_HISTORY_ENTRIES = 20  # 10 exchanges
+    # 30 entries = 15 exchanges — enough context for conversation continuity
+    # without losing important mid-conversation context.
+    MAX_HISTORY_ENTRIES = 30  # 15 exchanges
 
     # NLP command classification cooldown: avoid calling Gemini NLP for every
     # utterance classified as 'chat'. Cache the last result briefly.
@@ -87,12 +87,11 @@ class GeminiBrain:
         if self._client is None:
             return "I'm having trouble connecting to my brain right now. Let me try again."
 
-        # Build the message with emotion context
-        emotion_tag = ""
+        # Build the message with emotion context — concise format to save tokens
         if emotion != "neutral" and confidence > 0.3:
-            emotion_tag = f"[EMOTION DETECTED: {emotion} (confidence: {confidence:.0%})]\n"
-
-        full_message = f"{emotion_tag}User says: {user_text}"
+            full_message = f"[EMOTION: {emotion}] {user_text}"
+        else:
+            full_message = user_text
 
         logger.info(f"🧠 Thinking... input='{user_text}' emotion={emotion}")
 
@@ -100,7 +99,7 @@ class GeminiBrain:
             # Build conversation with history (system prompt sent via config)
             messages = []
 
-            # Add conversation history (keep last 10 exchanges = 20 entries)
+            # Add conversation history
             with self._lock:
                 for entry in self._chat_history[-self.MAX_HISTORY_ENTRIES:]:
                     messages.append(entry)
@@ -160,12 +159,11 @@ class GeminiBrain:
             yield "I'm having trouble connecting to my brain right now. Let me try again."
             return
 
-        # Build the message with emotion context
-        emotion_tag = ""
+        # Build the message with emotion context — concise format to save tokens
         if emotion != "neutral" and confidence > 0.3:
-            emotion_tag = f"[EMOTION DETECTED: {emotion} (confidence: {confidence:.0%})]\n"
-
-        full_message = f"{emotion_tag}User says: {user_text}"
+            full_message = f"[EMOTION: {emotion}] {user_text}"
+        else:
+            full_message = user_text
 
         logger.info(f"🧠 Thinking (stream)... input='{user_text}' emotion={emotion}")
 
