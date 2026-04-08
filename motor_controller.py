@@ -251,12 +251,15 @@ class MotorController:
     def _timed_stop(self, duration: float):
         """Stop motors after duration seconds in a background thread.
         This avoids blocking the calling thread (e.g. voice command handler),
-        so the robot stays responsive to 'stop' commands during timed moves."""
+        so the robot stays responsive to 'stop' commands during timed moves.
+        Uses _move_start_time to detect if a new move was issued during sleep."""
+        move_id = self._move_start_time  # Snapshot the current move identity
         def _wait_and_stop():
             time.sleep(duration)
-            # Only stop if we're still in the same move (not interrupted)
-            if self.running:
-                self.stop()
+            # Only stop if we're still in the SAME move (not interrupted by a new command)
+            with self._lock:
+                if self.running and self._move_start_time == move_id:
+                    self._force_stop()
         t = threading.Thread(target=_wait_and_stop, daemon=True)
         t.start()
 
@@ -282,6 +285,7 @@ class MotorController:
         if speed is not None:
             self._speed = max(0, min(100, speed))
         with self._lock:
+            self.running = True
             self._move_start_time = time.time()
         self._set_motors(False, False, False, True)
 
@@ -290,6 +294,7 @@ class MotorController:
         if speed is not None:
             self._speed = max(0, min(100, speed))
         with self._lock:
+            self.running = True
             self._move_start_time = time.time()
         self._set_motors(False, True, False, False)
 

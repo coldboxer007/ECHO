@@ -364,14 +364,9 @@ class ECHODebug(ECHO):
                 if cmd_type == 'chat':
                     words = user_text.split()
                     text_lower_strip = user_text.lower().strip()
-                    _CHAT_INDICATORS = {'what', 'why', 'how', 'when', 'where', 'who',
-                                        'tell', 'explain', 'think', 'feel', 'know',
-                                        'like', 'love', 'hate', 'want', 'need',
-                                        'can you', 'do you', 'are you', 'is it',
-                                        'have you', "what's", "how's", "who's"}
                     is_likely_chat = (
                         len(words) > 6
-                        or any(text_lower_strip.startswith(w) for w in _CHAT_INDICATORS)
+                        or any(text_lower_strip.startswith(w) for w in self._CHAT_INDICATORS)
                         or '?' in user_text
                     )
                     if is_likely_chat:
@@ -502,61 +497,16 @@ class ECHODebug(ECHO):
         dp("VOLUME", f"Volume now: {self.speech.volume:.2f}x", C_GREEN)
 
     def _handle_chat(self, user_text: str, emotion: str, confidence: float):
-        """Handle conversation with streaming think→TTS pipeline + debug output."""
-        self.face.set_emotion(emotion)
-
-        dp("BRAIN", f"Sending to Gemini (streaming)...", C_MAGENTA)
+        """Handle conversation using the inherited TTS pipeline + debug output."""
+        dp("BRAIN", f"Sending to Gemini (streaming pipeline)...", C_MAGENTA)
         dp("BRAIN", f"  Input: \"{user_text}\"", C_MAGENTA)
         dp("BRAIN", f"  Emotion context: {emotion} ({confidence:.0%})", C_MAGENTA)
 
-        # "Thinking" state — distinct visual/audio indicator
-        self.face.set_state("thinking")
+        # Use the base class pipelined implementation (producer-consumer TTS)
+        super()._handle_chat(user_text, emotion, confidence)
+        self._speak_count += 1
 
-        # Play brief audio cue so user knows ECHO heard them
-        self.speech.play_thinking_cue()
-        dp("SPEAK", "♪ Thinking cue played", C_DIM)
-
-        # Stream Gemini response sentence-by-sentence
-        full_response = ""
-        first_sentence = True
-        response_emotion = emotion  # default until first sentence arrives
-        sentence_count = 0
-
-        for sentence in self.brain.think_stream(user_text, emotion, confidence):
-            sentence_count += 1
-            if first_sentence:
-                self.face.set_state(None)  # Clear thinking state
-                first_sentence = False
-
-                # Determine response emotion from first sentence
-                response_emotion = self.brain.determine_response_emotion(sentence, emotion)
-                dp("EMOTION", f"Response emotion: {response_emotion}", C_CYAN)
-                self.face.set_emotion(response_emotion)
-
-            full_response += sentence + " "
-            dp("STREAM", f"  [{sentence_count}] \"{sentence}\"", C_GREEN)
-
-            # Speak each sentence as it arrives (mouth sync handled by callback)
-            self.speech.speak(sentence, emotion=response_emotion)
-            self._speak_count += 1
-
-        # If no sentences came through (empty response)
-        if not full_response.strip():
-            self.face.set_state(None)
-            full_response = "Hmm, I'm not sure what to say about that."
-            response_emotion = "neutral"
-            dp("BRAIN", "⚠️  No response from Gemini, using default", C_YELLOW)
-            self.face.set_emotion(response_emotion)
-            self.speech.speak(full_response, emotion=response_emotion)
-            self._speak_count += 1
-
-        dp("OUTPUT", f"🤖 ECHO says: \"{full_response.strip()}\"", C_GREEN)
-        dp("STREAM", f"Total sentences streamed: {sentence_count}", C_DIM)
-
-        # Ensure mouth stops and face returns to neutral
-        self.face.set_talking(False)
-        time.sleep(0.5)
-        self.face.set_emotion("neutral")
+        dp("OUTPUT", f"🤖 Chat turn complete", C_GREEN)
 
     # ═══════════════════════════════════════════
     # Shutdown

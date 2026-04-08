@@ -14,6 +14,7 @@ import struct
 import logging
 import tempfile
 import threading
+import subprocess
 import ctypes
 import numpy as np
 
@@ -74,6 +75,17 @@ from config import (
 
 class SpeechEngine:
     """Handles speech-to-text (Faster Whisper) and text-to-speech (Gemini TTS)."""
+
+    # Emotion → TTS voice direction map (shared by all TTS methods)
+    _EMOTION_DIRECTIONS = {
+        "happy":    "Say this warmly and cheerfully with a smile in your voice:",
+        "sad":      "Say this gently and softly with empathy:",
+        "angry":    "Say this in a calm, reassuring tone:",
+        "surprise": "Say this with gentle excitement and wonder:",
+        "fear":     "Say this in a warm, comforting and reassuring way:",
+        "disgust":  "Say this calmly and matter-of-factly:",
+        "neutral":  "Say this in a friendly, conversational tone:",
+    }
 
     def __init__(self):
         self._whisper_model = None
@@ -296,9 +308,9 @@ class SpeechEngine:
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 frames.append(data)
 
-                # Calculate RMS for silence detection
-                samples = struct.unpack(f'{CHUNK}h', data)
-                rms = (sum(s * s for s in samples) / CHUNK) ** 0.5
+                # Calculate RMS for silence detection (numpy is ~5x faster than struct.unpack)
+                samples = np.frombuffer(data, dtype=np.int16)
+                rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
 
                 if rms > AUDIO_SILENCE_THRESHOLD:
                     has_speech = True
@@ -514,17 +526,7 @@ class SpeechEngine:
         """Use Gemini TTS API for high-quality emotional speech.
         True streaming: plays audio chunks as they arrive from the API,
         reducing time-to-first-audio by 1-3 seconds."""
-        # Build an expressive prompt with emotion cues
-        emotion_directions = {
-            "happy":    "Say this warmly and cheerfully with a smile in your voice:",
-            "sad":      "Say this gently and softly with empathy:",
-            "angry":    "Say this in a calm, reassuring tone:",
-            "surprise": "Say this with gentle excitement and wonder:",
-            "fear":     "Say this in a warm, comforting and reassuring way:",
-            "disgust":  "Say this calmly and matter-of-factly:",
-            "neutral":  "Say this in a friendly, conversational tone:",
-        }
-        direction = emotion_directions.get(emotion, emotion_directions["neutral"])
+        direction = self._EMOTION_DIRECTIONS.get(emotion, self._EMOTION_DIRECTIONS["neutral"])
         prompt = f"{direction}\n\"{text}\""
 
         try:
@@ -573,16 +575,7 @@ class SpeechEngine:
 
     def _speak_gemini_nonstream(self, text: str, emotion: str = "neutral"):
         """Non-streaming Gemini TTS fallback (original implementation)."""
-        emotion_directions = {
-            "happy":    "Say this warmly and cheerfully with a smile in your voice:",
-            "sad":      "Say this gently and softly with empathy:",
-            "angry":    "Say this in a calm, reassuring tone:",
-            "surprise": "Say this with gentle excitement and wonder:",
-            "fear":     "Say this in a warm, comforting and reassuring way:",
-            "disgust":  "Say this calmly and matter-of-factly:",
-            "neutral":  "Say this in a friendly, conversational tone:",
-        }
-        direction = emotion_directions.get(emotion, emotion_directions["neutral"])
+        direction = self._EMOTION_DIRECTIONS.get(emotion, self._EMOTION_DIRECTIONS["neutral"])
         prompt = f"{direction}\n\"{text}\""
 
         response = self._genai_client.models.generate_content(
@@ -615,7 +608,6 @@ class SpeechEngine:
     def _speak_fallback(self, text: str):
         """Fallback TTS using the configured engine (works offline on RPi)."""
         try:
-            import subprocess
             # Write to WAV first, then play via pw-play for proper routing
             tmp_wav = os.path.join(tempfile.gettempdir(), "echo_espeak.wav")
             subprocess.run(
@@ -669,8 +661,6 @@ class SpeechEngine:
         if not audio_bytes:
             logger.warning("No audio data to play")
             return
-
-        import subprocess
 
         # Boost volume — Gemini TTS output can be quiet
         # Base boost of 2x (+6dB), then apply user volume multiplier
@@ -777,16 +767,7 @@ class SpeechEngine:
         if not text or self._genai_client is None:
             return None, 0
 
-        emotion_directions = {
-            "happy":    "Say this warmly and cheerfully with a smile in your voice:",
-            "sad":      "Say this gently and softly with empathy:",
-            "angry":    "Say this in a calm, reassuring tone:",
-            "surprise": "Say this with gentle excitement and wonder:",
-            "fear":     "Say this in a warm, comforting and reassuring way:",
-            "disgust":  "Say this calmly and matter-of-factly:",
-            "neutral":  "Say this in a friendly, conversational tone:",
-        }
-        direction = emotion_directions.get(emotion, emotion_directions["neutral"])
+        direction = self._EMOTION_DIRECTIONS.get(emotion, self._EMOTION_DIRECTIONS["neutral"])
         prompt = f"{direction}\n\"{text}\""
 
         try:

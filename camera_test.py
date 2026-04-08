@@ -119,8 +119,8 @@ def load_face_detector():
 
 
 def run_inference(interpreter, input_details, output_details, face_roi):
-    """Run TFLite inference on a face ROI. Returns softmax probabilities array."""
-    input_shape = input_details[0]['shape']  # e.g. [1, 48, 48, 1]
+    """Run TFLite inference on a face ROI. Returns probabilities array."""
+    input_shape = input_details[0]['shape']  # e.g. [1, 224, 224, 3]
     target_h, target_w = input_shape[1], input_shape[2]
     channels = input_shape[3]
 
@@ -131,7 +131,10 @@ def run_inference(interpreter, input_details, output_details, face_roi):
         face_input = face_gray.astype(np.float32) / 255.0
         face_input = np.expand_dims(face_input, axis=-1)
     else:
-        face_input = face_resized.astype(np.float32) / 255.0
+        # Convert BGR → RGB (OpenCV captures in BGR, model trained on RGB)
+        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+        # EfficientNet normalization: scale to [-1, 1]
+        face_input = face_rgb.astype(np.float32) / 127.5 - 1.0
 
     face_input = np.expand_dims(face_input, axis=0)  # batch dim
 
@@ -142,11 +145,17 @@ def run_inference(interpreter, input_details, output_details, face_roi):
     interpreter.invoke()
     output = interpreter.get_tensor(output_details[0]['index'])
 
-    # Softmax
+    # Model outputs softmax probabilities — do NOT apply softmax again
     raw = output[0].astype(np.float64)
-    shifted = raw - np.max(raw)
-    exp_vals = np.exp(shifted)
-    probs = exp_vals / np.sum(exp_vals)
+    output_sum = np.sum(raw)
+    if abs(output_sum - 1.0) < 0.01:
+        # Already softmax — use directly
+        probs = raw
+    else:
+        # Raw logits — apply softmax
+        shifted = raw - np.max(raw)
+        exp_vals = np.exp(shifted)
+        probs = exp_vals / np.sum(exp_vals)
     return probs
 
 
@@ -343,7 +352,7 @@ def main():
             # ── Face detection ──
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48)
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
             )
             faces = list(faces)
 

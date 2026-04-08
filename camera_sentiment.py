@@ -168,7 +168,7 @@ class CameraSentiment:
             gray,
             scaleFactor=1.1,
             minNeighbors=5,
-            minSize=(48, 48),
+            minSize=(80, 80),
         )
         result = list(faces)
 
@@ -205,7 +205,7 @@ class CameraSentiment:
 
         try:
             # Preprocess for TFLite model
-            input_shape = self._input_details[0]['shape']  # e.g., [1, 48, 48, 1] or [1, 48, 48, 3]
+            input_shape = self._input_details[0]['shape']  # e.g., [1, 224, 224, 3]
             target_h, target_w = input_shape[1], input_shape[2]
             channels = input_shape[3]
 
@@ -216,7 +216,10 @@ class CameraSentiment:
                 face_input = face_gray.astype(np.float32) / 255.0
                 face_input = np.expand_dims(face_input, axis=-1)  # Add channel dim
             else:
-                face_input = face_resized.astype(np.float32) / 255.0
+                # Convert BGR → RGB (OpenCV captures in BGR, model trained on RGB)
+                face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+                # EfficientNet normalization: scale to [-1, 1]
+                face_input = face_rgb.astype(np.float32) / 127.5 - 1.0
 
             face_input = np.expand_dims(face_input, axis=0)  # Add batch dim
 
@@ -228,12 +231,18 @@ class CameraSentiment:
             self._interpreter.invoke()
             output = self._interpreter.get_tensor(self._output_details[0]['index'])
 
-            # Parse output — apply softmax to convert raw logits to probabilities
+            # Parse output — model outputs softmax probabilities (sum ≈ 1.0)
+            # Do NOT apply softmax again; double-softmax flattens the distribution
             raw = output[0].astype(np.float64)
-            # Numerical-stable softmax
-            shifted = raw - np.max(raw)
-            exp_vals = np.exp(shifted)
-            probabilities = exp_vals / np.sum(exp_vals)
+            output_sum = np.sum(raw)
+            if abs(output_sum - 1.0) < 0.01:
+                # Already softmax — use directly
+                probabilities = raw
+            else:
+                # Raw logits — apply softmax
+                shifted = raw - np.max(raw)
+                exp_vals = np.exp(shifted)
+                probabilities = exp_vals / np.sum(exp_vals)
 
             # Temporal smoothing via EMA — reduces emotion flicker from noisy frames
             for i, label in enumerate(SENTIMENT_LABELS):
@@ -250,8 +259,7 @@ class CameraSentiment:
             max_idx = int(np.argmax(probabilities))
             confidence = float(probabilities[max_idx])
             logger.debug(
-                f"Sentiment raw logits: {raw.tolist()}, "
-                f"softmax: {probabilities.tolist()}, "
+                f"Sentiment probs: {probabilities.tolist()}, "
                 f"best: idx={max_idx} conf={confidence:.3f}, "
                 f"smoothed: {smoothed_emotion} ({smoothed_confidence:.3f})"
             )

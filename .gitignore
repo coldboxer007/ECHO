@@ -34,6 +34,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Mac testing scripts (local only)
+test_sentiment_mac.py
+
 # Logs
 *.log
 logs/

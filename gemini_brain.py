@@ -9,6 +9,7 @@ and scene understanding when needed.
 """
 
 import re
+import json
 import time
 import logging
 import threading
@@ -390,7 +391,6 @@ class GeminiBrain:
             return self._last_nlp_result
 
         try:
-            import json as _json
             prompt = (
                 "You are a robot command classifier. Given the user's speech, determine if it's "
                 "a physical movement command or just conversation.\n\n"
@@ -422,7 +422,7 @@ class GeminiBrain:
             if result_text.startswith("```"):
                 result_text = result_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-            data = _json.loads(result_text)
+            data = json.loads(result_text)
             cmd_type = data.get("type", "chat")
 
             # Validate and build result
@@ -496,7 +496,6 @@ class GeminiBrain:
                 ),
             )
 
-            import json
             text = response.text.strip()
             # Clean markdown code fences if present
             if text.startswith("```"):
@@ -545,7 +544,6 @@ class GeminiBrain:
                 ),
             )
 
-            import json
             text = response.text.strip()
             # Clean markdown code fences if present
             if text.startswith("```"):

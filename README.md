@@ -51,7 +51,7 @@ ECHO is a **fully autonomous companion robot** built on a Raspberry Pi 4B. It co
 - **Animated robot face** — full-screen pygame display with smooth eye animations, blinking, pupil wandering, breathing, and emotion transitions
 - **Motor control** — 6 DC motors (3 per side) via L298N driver for tank-steer movement
 - **Obstacle avoidance** — HC-SR04 ultrasonic + IR sensors for real-time safety
-- **Camera sentiment analysis** — USB webcam with Haar cascade face detection + optional TFLite emotion model
+- **Camera sentiment analysis** — USB webcam with Haar cascade face detection + EfficientNet TFLite emotion model (224x224 RGB, properly normalized)
 - **Complex movement commands** — "go forward carefully", "keep moving", "patrol", "stop when there's an obstacle"
 - **Person following** — camera-based face tracking with motor steering
 
@@ -256,7 +256,7 @@ The L298N controls 6 motors organized as two groups of 3 (left side + right side
 | **Live API** | Gemini 2.5 Flash Native Audio Preview | Alternative: bidirectional audio streaming |
 | **Face Display** | Pygame 2.6.1 (SDL2) | Animated robot face rendering |
 | **Vision** | OpenCV 4.x + Haar cascades | Face detection |
-| **Sentiment** | AI Edge LiteRT / TFLite (FER 3-stage FP16) | Facial emotion recognition (optional) |
+| **Sentiment** | AI Edge LiteRT / TFLite (FER 3-stage FP16, EfficientNet) | Facial emotion recognition (224x224 RGB, [-1,1] normalized) |
 | **GPIO** | RPi.GPIO (lgpio backend) | Motor and sensor control |
 | **Audio I/O** | PyAudio (capture) + pw-play (output) | Mic input + speaker output |
 | **Fallback TTS** | espeak | Offline TTS when Gemini is unavailable |
@@ -269,7 +269,7 @@ The L298N controls 6 motors organized as two groups of 3 (left side + right side
 ECHOtest/
 ├── main.py                  # Main entry point — the listen→think→speak→act loop
 ├── debug_main.py            # Verbose debug mode (inherits from ECHO, color-coded output)
-├── live_main.py             # Alternative: Gemini Live API bidirectional audio mode
+├── live_main.py             # Full Gemini Live API mode with function calling + all hardware integration
 ├── config.py                # ALL settings, pin assignments, model paths, prompts, MOTOR_PWM_ENABLED
 ├── motor_controller.py      # L298N motor driver — PWM/GPIO dual mode, watchdog, atexit safety
 ├── sensor_controller.py     # HC-SR04 ultrasonic (median-filtered) + IR obstacle detection
@@ -277,7 +277,7 @@ ECHOtest/
 ├── camera_test.py           # Standalone camera + TFLite test utility (face detection + emotion display)
 ├── speech_engine.py         # Faster-Whisper STT (in-memory) + streaming Gemini TTS + thinking cue + volume
 ├── gemini_brain.py          # Gemini AI conversation (streaming) + hybrid NLP command interpretation + vision
-├── gemini_live.py           # Gemini Live API engine (bidirectional audio stream)
+├── gemini_live.py           # Gemini Live API engine (bidirectional audio, function calling, reconnection)
 ├── face_display.py          # Pygame animated robot face (morphing emotions, gaze tracking, reactions)
 ├── navigation.py            # High-level movement: manual, follow (variable speed), patrol, safe move
 ├── battery_monitor.py       # Battery voltage monitoring stub (ready for ADS1115 ADC hardware)
@@ -471,8 +471,10 @@ A full-screen pygame animation running at 20fps on the HDMI display:
 1. **USB webcam** captures at 640x480 @ 15fps via OpenCV (`CAP_PROP_BUFFERSIZE=1` for fresh frames)
 2. **Haar cascade** (`haarcascade_frontalface_default.xml`) detects faces in grayscale. Results are **cached per frame** to avoid running detection twice (once for sentiment, once for follow mode).
 3. **TFLite model** (`fer_3stage_fp16.tflite`) classifies facial emotion via a 3-level runtime fallback chain (AI Edge LiteRT → tflite-runtime → tensorflow.lite):
-   - Input: 48x48 grayscale face crop
-   - Output: 7-class raw logits → softmax-normalized to probabilities (angry, disgust, fear, happy, sad, surprise, neutral)
+   - Input: 224x224 RGB face crop, EfficientNet-normalized (`pixel / 127.5 - 1.0`, range [-1, 1])
+   - BGR→RGB conversion applied before inference (OpenCV captures BGR natively)
+   - Output: 7-class softmax probabilities (angry, disgust, fear, happy, sad, surprise, neutral)
+   - Smart softmax detection: checks if output already sums to ~1.0 (skips redundant softmax for softmax-output models, applies it for raw-logit models)
    - Confidence threshold: 40%
    - **Emotion temporal smoothing** via exponential moving average (alpha=0.4) to reduce flickering
 4. **Adaptive backoff:** When no face is detected, analysis interval slows to 5x the normal rate to reduce CPU usage
@@ -560,13 +562,21 @@ The primary mode. Uses Faster-Whisper for local STT + Gemini for conversation + 
 ```bash
 python3 debug_main.py
 ```
-Same functionality as standard mode — `ECHODebug` inherits from the `ECHO` class and adds verbose, color-coded terminal output. Shows every sensor reading, command interpretation, API call, streaming sentence, gaze tracking, and timing breakdown in real-time. Includes a **live camera preview window** (OpenCV) showing the camera feed with face detection bounding boxes, current emotion label, and a per-emotion confidence bar chart — useful for monitoring the TFLite model's performance in real time. Also tracks session statistics (loop count, speech I/O, command breakdown including goodbye). Best for development and troubleshooting. Overrides handler methods to add debug logging while delegating to the base class via `super()`. Includes the full streaming think→TTS pipeline, hybrid NLP fallback, and gaze tracking — all with debug output.
+Same functionality as standard mode — `ECHODebug` inherits from the `ECHO` class and adds verbose, color-coded terminal output. Shows every sensor reading, command interpretation, API call, streaming sentence, gaze tracking, and timing breakdown in real-time. Includes a **live camera preview window** (OpenCV) showing the camera feed with face detection bounding boxes, current emotion label, and a per-emotion confidence bar chart — useful for monitoring the TFLite model's performance in real time. Also tracks session statistics (loop count, speech I/O, command breakdown including goodbye). Best for development and troubleshooting. Overrides handler methods to add debug logging while delegating to the base class via `super()` — including `_handle_chat()`, which uses the inherited producer-consumer TTS pipeline rather than a separate implementation. Includes the full streaming think→TTS pipeline, hybrid NLP fallback, and gaze tracking — all with debug output.
 
 ### Live API Mode (live_main.py)
 ```bash
 python3 live_main.py
 ```
-Experimental mode using Gemini Live API for bidirectional audio streaming. Replaces the separate Whisper STT + Gemini Chat + Gemini TTS pipeline with a single streaming connection. Benefits:
+Full-featured mode using Gemini Live API for bidirectional audio streaming with complete hardware integration. Replaces the separate Whisper STT → Gemini Chat → Gemini TTS pipeline with a single streaming connection. The Live engine (`gemini_live.py`) provides:
+- **Function calling** — 10 declared tools (`move_robot`, `stop_robot`, `start_follow_mode`, `start_patrol_mode`, `safe_move_forward`, `set_face_emotion`, `get_sensor_data`, `get_camera_emotion`, `set_volume`, `shutdown_robot`) so Gemini can control all robot hardware via natural conversation
+- **Thread-safe architecture** — `queue.Queue` bridges sync mic/camera threads to the async event loop (not `asyncio.Queue`)
+- **Proper API usage** — `send_realtime_input(audio=types.Blob(...))` for audio, `send_realtime_input(video=types.Blob(...))` for camera frames
+- **Interruption handling** — clears audio queue when `server_content.interrupted` is True
+- **Reconnection with exponential backoff** — up to 5 attempts, base 2s delay doubling each time
+- **Context window compression** — configured at 25600 trigger tokens, sliding to 12800 for long sessions
+- **Periodic context** — camera frames sent every 5s, emotion context text every 10s (only on change)
+- **Face gaze tracking** — updates face gaze from camera face detection in main loop
 - No local STT model needed (saves RAM + startup time)
 - Lower latency (streaming vs request/response)
 - Natural conversation with interruption support
@@ -950,6 +960,27 @@ The face display now has explicit state indicators beyond just emotions. `set_st
 ### 26. Simplified message format for Gemini
 The message format sent to Gemini was changed from `[EMOTION DETECTED: X (confidence: Y%)]\nUser says: Z` to simply `[EMOTION: X] Z`. This saves tokens on every API call, reduces prompt noise, and provides clearer context for the model without unnecessary verbosity.
 
+### 27. EfficientNet normalization for TFLite
+The TFLite emotion model (`fer_3stage_fp16.tflite`) expects 224x224 RGB input normalized with EfficientNet preprocessing: `pixel / 127.5 - 1.0` (range [-1, 1]). The original code used `/255.0` (range [0, 1]) and fed BGR images directly from OpenCV without color conversion. Combined with a redundant softmax on already-softmax output (double-softmax compressed the probability spread from 0.2226 to 0.0324), the model could never distinguish emotions — all classes appeared ~14% similar, and only the model's slight prior bias toward "happy" ever exceeded the 40% EMA threshold. Fixing normalization, adding BGR→RGB conversion, and detecting pre-softmax output resolved the "only detects happy" bug.
+
+### 28. Smart softmax detection
+Rather than hardcoding whether to apply softmax to TFLite model output, the code checks if the output already sums to approximately 1.0 (within tolerance of 0.1). If it does, the output is already softmax-normalized and is used directly. If not, softmax is applied. This makes the code model-agnostic — it works correctly with both raw-logit models and softmax-output models without configuration changes.
+
+### 29. Thread-safe queue bridge for Gemini Live
+The original `gemini_live.py` used `asyncio.Queue.put_nowait()` called from synchronous threads (mic capture, camera) — this is NOT thread-safe and can corrupt the queue's internal state. The rewrite uses `queue.Queue` (from Python's `queue` module, which is thread-safe) as a bridge between sync threads and the async event loop. The async tasks poll with `asyncio.sleep()` intervals rather than blocking on `queue.get()`.
+
+### 30. Function calling in Gemini Live mode
+The original `live_main.py` was a barebones audio-only demo — the robot could hear and speak but not move, sense obstacles, or show emotions. The rewrite declares 10 function tools to the Gemini Live session, allowing the model to control all hardware subsystems via natural conversation. Gemini Live's function calling is synchronous — the model pauses generation until it receives the tool response, ensuring actions complete before the conversation continues.
+
+### 31. Motor `_timed_stop` race condition fix
+The original `_timed_stop()` method slept for the move duration, then unconditionally stopped the motors. If a new move command was issued during the sleep, the old timer would wake up and stop the new move prematurely. The fix snapshots `_move_start_time` as a move identity before sleeping, and only stops the motors if that identity still matches when the timer wakes — meaning a newer move has not superseded it.
+
+### 32. Debug mode `_handle_chat` delegation
+`debug_main.py` originally contained a full copy of the chat logic using synchronous `self.speech.speak()` per sentence — no producer-consumer pipeline, making it 2-3x slower than main.py. Round 7 replaced this with `super()._handle_chat()` delegation wrapped with debug print statements, getting the inherited TTS pipeline for free and ensuring future improvements to main.py automatically propagate.
+
+### 33. Numpy RMS calculation
+The silence detection RMS calculation in `speech_engine.py` used `struct.unpack` to extract individual int16 samples, then computed RMS in pure Python. On RPi4, this is slow for the number of audio samples per chunk. Replacing it with `np.frombuffer(data, dtype=np.int16)` and `np.sqrt(np.mean(samples.astype(np.float32)**2))` is ~5x faster since numpy uses optimized C/BLAS operations.
+
 ---
 
 ## Future Directions
@@ -958,7 +989,7 @@ The message format sent to Gemini was changed from `[EMOTION DETECTED: X (confid
 
 1. ~~**PWM Speed Control**~~ — **DONE (Round 2), made optional (Round 3).** Software PWM (1000Hz) on all motor pins with configurable duty cycle. Follow mode uses variable speed based on face position. PWM can be disabled via `MOTOR_PWM_ENABLED = False` in config.py for setups that only need GPIO on/off control.
 
-2. **Gemini Live API as Primary Mode** — The `live_main.py` mode eliminates the separate Whisper → Gemini → TTS pipeline. With further testing, it could become the default, cutting latency from ~5-8s to under 2s for a full conversation turn.
+2. ~~**Gemini Live API as Primary Mode**~~ — **DONE (Round 7).** `live_main.py` is now a full-featured mode with complete hardware integration via function calling (10 tools: move, stop, follow, patrol, safe_move, set_emotion, get_sensors, get_emotion, set_volume, shutdown). Thread-safe queue bridge, reconnection with exponential backoff, context window compression, periodic camera/emotion context injection. Eliminates the separate Whisper → Gemini → TTS pipeline.
 
 3. ~~**Wake Word Detection**~~ — **DONE.** Post-Whisper text filter checks for "Echo"/"Hey Echo" prefix. Configurable via `WAKE_WORD_ENABLED` in config.py (off by default for minimal-friction interaction).
 
@@ -1028,10 +1059,18 @@ The message format sent to Gemini was changed from `[EMOTION DETECTED: X (confid
 
 36. ~~**Silence Duration Reduction**~~ — **DONE (Round 6).** `AUDIO_SILENCE_DURATION` reduced from 0.7s to 0.5s for faster response after the user finishes speaking.
 
+37. ~~**TFLite Preprocessing Fix**~~ — **DONE (Round 7).** Critical bug: model expected 224x224 RGB with EfficientNet normalization (`/127.5 - 1.0`), but code fed BGR with `/255.0` and applied double-softmax. Fixed BGR→RGB conversion, correct normalization, and smart softmax detection. Resolved "only detects happy" bug.
+
+38. ~~**Code Audit — Latency & Safety Fixes**~~ — **DONE (Round 7).** Removed 4 unnecessary `time.sleep(0.5)` calls from emotion change handlers. Moved inline imports (`subprocess`, `json`) to module level. Replaced `struct.unpack` RMS with numpy (~5x faster). Extracted `_EMOTION_DIRECTIONS` dict to class constant (was duplicated 3x). Fixed motor `_timed_stop` race condition. Fixed `slight_left/right` missing safety flags.
+
+39. ~~**Full Gemini Live Mode with Function Calling**~~ — **DONE (Round 7).** Complete rewrite of `gemini_live.py` (~530 lines) and `live_main.py` (~310 lines). 10 function tools for full hardware control. Thread-safe queue bridge. Proper `types.Blob` API usage. Reconnection with exponential backoff. Context window compression. Periodic camera frame and emotion context injection.
+
+40. ~~**Debug Mode Inheritance Cleanup**~~ — **DONE (Round 7).** `debug_main.py` `_handle_chat` replaced: was a full copy of chat logic with synchronous TTS (no pipeline). Now delegates to `super()._handle_chat()` with debug wrappers, inheriting the producer-consumer TTS pipeline. `_CHAT_INDICATORS` uses inherited class constant instead of duplicate dict.
+
 ### Known Limitations
 
 - **Single-language by default** — English only (Whisper tiny.en), but pipeline supports switching to multilingual mode via config (see Future Directions #24)
-- **TFLite runtime optional** — sentiment defaults to "neutral" without it; uses 3-level import fallback (ai-edge-litert → tflite-runtime → tensorflow.lite); model output is softmax-normalized for correct probability interpretation
+- **TFLite runtime optional** — sentiment defaults to "neutral" without it; uses 3-level import fallback (ai-edge-litert → tflite-runtime → tensorflow.lite); model expects 224x224 RGB with EfficientNet normalization; smart softmax detection handles both softmax and raw-logit model outputs
 - **WiFi dependent** — Gemini API requires internet connectivity
 - **5V/3.3V mismatch** — HC-SR04 ECHO pin needs a voltage divider
 - **No rear sensors** — backward movement logs a warning but cannot detect obstacles behind the robot

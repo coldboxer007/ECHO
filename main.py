@@ -50,6 +50,16 @@ class ECHO:
     # Minimum seconds between Gemini vision emotion fallback API calls
     _EMOTION_FALLBACK_COOLDOWN = 10.0
 
+    # Words/phrases that indicate the input is conversation, not a movement command.
+    # Used to skip expensive Gemini NLP classification for obvious chat.
+    _CHAT_INDICATORS = frozenset({
+        'what', 'why', 'how', 'when', 'where', 'who',
+        'tell', 'explain', 'think', 'feel', 'know',
+        'like', 'love', 'hate', 'want', 'need',
+        'can you', 'do you', 'are you', 'is it',
+        'have you', "what's", "how's", "who's",
+    })
+
     def __init__(self):
         logger.info("=" * 50)
         logger.info("  ECHO Robot — Starting Up...")
@@ -208,14 +218,9 @@ class ECHO:
                     # to save 1-2s of API latency per interaction.
                     words = user_text.split()
                     text_lower_strip = user_text.lower().strip()
-                    _CHAT_INDICATORS = {'what', 'why', 'how', 'when', 'where', 'who',
-                                        'tell', 'explain', 'think', 'feel', 'know',
-                                        'like', 'love', 'hate', 'want', 'need',
-                                        'can you', 'do you', 'are you', 'is it',
-                                        'have you', "what's", "how's", "who's"}
                     is_likely_chat = (
                         len(words) > 6  # Long sentences are almost never movement
-                        or any(text_lower_strip.startswith(w) for w in _CHAT_INDICATORS)
+                        or any(text_lower_strip.startswith(w) for w in self._CHAT_INDICATORS)
                         or '?' in user_text  # Questions are conversation
                     )
                     if not is_likely_chat:
@@ -296,7 +301,8 @@ class ECHO:
             # Speak on failure (obstacle blocked)
             self.speech.speak("Obstacle ahead!", emotion="surprise")
             self.face.set_emotion("surprise")
-            time.sleep(0.5)
+            # Face transitions back to neutral after a brief display;
+            # the FaceDisplay class handles smooth transitions internally.
             self.face.set_emotion("neutral")
 
     def _handle_keep_moving(self, command: dict):
@@ -359,7 +365,6 @@ class ECHO:
         if frame_jpeg is None:
             self.speech.speak("I can't see anything right now. My camera might be off.", emotion="sad")
             self.face.set_emotion("sad")
-            time.sleep(0.5)
             self.face.set_emotion("neutral")
             return
 
@@ -374,7 +379,6 @@ class ECHO:
         else:
             self.speech.speak("I looked but I'm having trouble describing what I see.", emotion="neutral")
 
-        time.sleep(0.5)
         self.face.set_emotion("neutral")
 
     def _handle_volume(self, command: dict):
@@ -490,7 +494,6 @@ class ECHO:
 
         # Ensure mouth stops and face returns to neutral
         self.face.set_talking(False)
-        time.sleep(0.5)
         self.face.set_emotion("neutral")
 
     # ═══════════════════════════════════════════
