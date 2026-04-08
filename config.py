@@ -87,7 +87,7 @@ AUDIO_SAMPLE_RATE = 16000  # 16kHz for Whisper
 AUDIO_CHANNELS = 1
 AUDIO_CHUNK_DURATION = 8   # Max seconds per voice command recording (increased from 5 — longer sentences were getting truncated)
 AUDIO_SILENCE_THRESHOLD = 150  # RMS threshold for silence detection (tuned for Zeb SoundMX USB mic)
-AUDIO_SILENCE_DURATION = 0.5   # Seconds of silence before stopping recording (reduced from 0.7 for faster response)
+AUDIO_SILENCE_DURATION = 0.7   # Seconds of silence before stopping recording (reverted closer to Round 2 default — 0.5 was cutting off speech too early)
 
 # Wake word gate: when enabled, only process speech that starts with a wake phrase.
 # Set to False for always-listening mode (original behavior).

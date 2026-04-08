@@ -372,11 +372,9 @@ class SpeechEngine:
                 beam_size=WHISPER_BEAM_SIZE,
                 language=WHISPER_LANGUAGE,
                 vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,   # Don't split on short pauses
-                    speech_pad_ms=200,             # Pad speech segments to avoid clipping
-                    threshold=0.35,                # Lower threshold = more sensitive to speech (default 0.5)
-                ),
+                # VAD parameters left at defaults (threshold=0.5, min_silence_duration_ms=2000,
+                # speech_pad_ms=400) — Round 2 defaults worked best. Custom over-tuning in
+                # Rounds 3-6 caused noise sensitivity and utterance splitting.
             )
 
             text = " ".join(segment.text.strip() for segment in segments).strip()
@@ -413,11 +411,7 @@ class SpeechEngine:
                 beam_size=WHISPER_BEAM_SIZE,
                 language=WHISPER_LANGUAGE,
                 vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,
-                    speech_pad_ms=200,
-                    threshold=0.35,
-                ),
+                # VAD parameters left at defaults (same as in-memory path above)
             )
 
             text = " ".join(segment.text.strip() for segment in segments).strip()
@@ -451,16 +445,15 @@ class SpeechEngine:
         "thank you",
         "you",
         "the end",
-        "bye",
         "...",
-        "okay",
         "so",
         "uh",
         "um",
         "hmm",
         "huh",
-        "oh",
-        "ah",
+        # Removed "bye" — blocks goodbye command
+        # Removed "okay" — legitimate acknowledgment
+        # Removed "oh", "ah" — legitimate expressions
     }
 
     def _filter_hallucinations(self, text: str) -> str:

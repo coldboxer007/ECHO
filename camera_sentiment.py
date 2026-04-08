@@ -191,6 +191,12 @@ class CameraSentiment:
         # Detect faces
         faces = self.detect_faces(frame)
         if len(faces) == 0:
+            # Decay EMA scores when no face visible (matching Mac test script)
+            # Prevents stale emotions from persisting after a face disappears
+            for label in self._emotion_scores:
+                self._emotion_scores[label] *= 0.95
+            self._current_emotion = "neutral"
+            self._current_confidence = 0.0
             return "neutral", 0.0
 
         # Use the largest face
@@ -209,7 +215,7 @@ class CameraSentiment:
             target_h, target_w = input_shape[1], input_shape[2]
             channels = input_shape[3]
 
-            face_resized = cv2.resize(face_roi, (target_w, target_h))
+            face_resized = cv2.resize(face_roi, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
             if channels == 1:
                 face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)

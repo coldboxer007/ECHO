@@ -113,7 +113,7 @@ class ECHO:
         self.face.start()
 
         # Startup greeting
-        time.sleep(1)
+        time.sleep(0.5)  # Brief pause for background services to initialize
         self.face.set_emotion("happy")
         self.speech.speak(
             "Hello! I'm Echo, your companion robot. How can I help you today?",

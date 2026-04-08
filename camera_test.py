@@ -124,7 +124,7 @@ def run_inference(interpreter, input_details, output_details, face_roi):
     target_h, target_w = input_shape[1], input_shape[2]
     channels = input_shape[3]
 
-    face_resized = cv2.resize(face_roi, (target_w, target_h))
+    face_resized = cv2.resize(face_roi, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
     if channels == 1:
         face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
