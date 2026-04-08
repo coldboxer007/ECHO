@@ -20,23 +20,33 @@ import cv2
 
 logger = logging.getLogger("echo.camera")
 
-# Try TFLite runtime (lightweight, preferred on RPi)
+# Try TFLite runtimes in order of preference:
+#   1. ai-edge-litert (Google's official replacement for tflite-runtime)
+#   2. tflite-runtime  (legacy, still common)
+#   3. Full TensorFlow  (heavy, last resort)
 try:
-    import tflite_runtime.interpreter as tflite
+    from ai_edge_litert.interpreter import Interpreter as _TFLiteInterpreter
     TFLITE_AVAILABLE = True
-    logger.info("Using tflite_runtime")
-except ImportError:
+    logger.info("Using ai-edge-litert")
+except (ImportError, AttributeError):
     try:
-        import tensorflow.lite as tflite
+        import tflite_runtime.interpreter as _tflite_mod
+        _TFLiteInterpreter = _tflite_mod.Interpreter
         TFLITE_AVAILABLE = True
-        logger.info("Using tensorflow.lite")
-    except ImportError:
-        TFLITE_AVAILABLE = False
-        logger.warning(
-            "No TFLite runtime available — sentiment will always be 'neutral'. "
-            "Install with: pip install tflite-runtime  (or for RPi: "
-            "pip install --index-url https://google-coral.github.io/py-repo/ tflite_runtime)"
-        )
+        logger.info("Using tflite_runtime")
+    except (ImportError, AttributeError):
+        try:
+            import tensorflow.lite as _tflite_mod
+            _TFLiteInterpreter = _tflite_mod.Interpreter
+            TFLITE_AVAILABLE = True
+            logger.info("Using tensorflow.lite")
+        except (ImportError, AttributeError):
+            _TFLiteInterpreter = None
+            TFLITE_AVAILABLE = False
+            logger.warning(
+                "No TFLite runtime available — sentiment will always be 'neutral'. "
+                "Install with: pip install ai-edge-litert"
+            )
 
 from config import (
     CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS,
@@ -101,7 +111,7 @@ class CameraSentiment:
             return
 
         try:
-            self._interpreter = tflite.Interpreter(model_path=SENTIMENT_MODEL_PATH)
+            self._interpreter = _TFLiteInterpreter(model_path=SENTIMENT_MODEL_PATH)
             self._interpreter.allocate_tensors()
             self._input_details = self._interpreter.get_input_details()
             self._output_details = self._interpreter.get_output_details()

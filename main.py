@@ -46,12 +46,16 @@ class ECHO:
     listen → think → speak → act loop.
     """
 
+    # Minimum seconds between Gemini vision emotion fallback API calls
+    _EMOTION_FALLBACK_COOLDOWN = 10.0
+
     def __init__(self):
         logger.info("=" * 50)
-        logger.info("  🤖 ECHO Robot — Starting Up...")
+        logger.info("  ECHO Robot — Starting Up...")
         logger.info("=" * 50)
 
         self._running = False
+        self._last_emotion_fallback = 0.0  # monotonic timestamp of last Gemini emotion call
 
         # Initialize subsystems (order matters)
         logger.info("Initializing motors...")
@@ -160,16 +164,19 @@ class ECHO:
 
                 # ── Step 2: Get current emotion from camera ──
                 # Use local TFLite model; fall back to Gemini vision if low confidence
+                # (rate-limited to avoid wasteful API calls every listen cycle)
                 emotion = self.camera.current_emotion
                 confidence = self.camera.current_confidence
                 if emotion == "neutral" and confidence < 0.3:
-                    # Low confidence — try Gemini vision fallback
-                    frame_jpeg = self.camera.get_frame_jpeg()
-                    if frame_jpeg:
-                        try:
-                            emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
-                        except Exception as e:
-                            logger.debug(f"Gemini emotion fallback failed: {e}")
+                    now = time.monotonic()
+                    if (now - self._last_emotion_fallback) >= self._EMOTION_FALLBACK_COOLDOWN:
+                        frame_jpeg = self.camera.get_frame_jpeg()
+                        if frame_jpeg:
+                            try:
+                                emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
+                                self._last_emotion_fallback = now
+                            except Exception as e:
+                                logger.debug(f"Gemini emotion fallback failed: {e}")
                 logger.info(f"😊 Detected emotion: {emotion} ({confidence:.0%})")
 
                 # ── Step 2b: Update face gaze to track detected face ──
@@ -376,6 +383,7 @@ class ECHO:
         # Stream Gemini response sentence-by-sentence
         full_response = ""
         first_sentence = True
+        response_emotion = emotion  # Default to user emotion until first sentence determines it
 
         for sentence in self.brain.think_stream(user_text, emotion, confidence):
             if first_sentence:
@@ -384,14 +392,14 @@ class ECHO:
 
                 # Determine response emotion from first sentence
                 response_emotion = self.brain.determine_response_emotion(sentence, emotion)
-                logger.info(f"🎭 Response emotion: {response_emotion}")
+                logger.info(f"Response emotion: {response_emotion}")
                 self.face.set_emotion(response_emotion)
 
             full_response += sentence + " "
 
             # Speak each sentence as it arrives
             self.face.set_talking(True)
-            self.speech.speak(sentence, emotion=response_emotion if not first_sentence else emotion)
+            self.speech.speak(sentence, emotion=response_emotion)
 
         # If no sentences came through (empty response)
         if not full_response.strip():

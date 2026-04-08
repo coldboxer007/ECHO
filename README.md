@@ -116,9 +116,10 @@ The robot understands natural language, sees facial emotions via camera, respond
 
 ```
 User speaks → Mic captures audio (PyAudio @ 44100Hz)
-  → Silence detection stops recording (0.7s silence threshold)
-  → Faster-Whisper tiny.en transcribes (in-memory float32 array, no temp file)
-  → Wake word gate (optional — strips "Echo"/"Hey Echo" prefix, discards non-matching)
+   → Silence detection stops recording (0.7s silence threshold)
+   → Faster-Whisper tiny.en transcribes (in-memory float32 array, no temp file)
+   → Hallucination filter strips known Whisper artifacts ("thank you for watching", etc.)
+   → Wake word gate (optional — strips "Echo"/"Hey Echo" prefix, discards non-matching)
   → GeminiBrain.interpret_command() routes to handler:
       ├─ If 'chat' → interpret_command_nlp() Gemini fallback for natural language
       │   (e.g. "come ahead" → reclassified as move/forward)
@@ -133,8 +134,8 @@ User speaks → Mic captures audio (PyAudio @ 44100Hz)
       ├─ Volume → Adjusts TTS playback volume (louder/quieter)
       ├─ Clear history → Resets conversation memory
       └─ Chat → Gemini 2.5 Flash streams response sentence-by-sentence
-               → play_thinking_cue() (440Hz→660Hz beep, ~200ms)
-               → think_stream() yields sentences as they complete
+               → play_thinking_cue() (440Hz→660Hz beep, ~200ms, direct PyAudio playback)
+               → think_stream() yields sentences as they complete (splits on . ! ? and \\n)
                → determine_response_emotion() picks face emotion from first sentence
                → FaceDisplay shows emotion (shape-morphing transition)
                → Gemini TTS streams each sentence (with volume control)
@@ -251,7 +252,7 @@ The L298N controls 6 motors organized as two groups of 3 (left side + right side
 | **Live API** | Gemini 2.5 Flash Native Audio Preview | Alternative: bidirectional audio streaming |
 | **Face Display** | Pygame 2.6.1 (SDL2) | Animated robot face rendering |
 | **Vision** | OpenCV 4.x + Haar cascades | Face detection |
-| **Sentiment** | TFLite (FER 3-stage FP16) | Facial emotion recognition (optional) |
+| **Sentiment** | AI Edge LiteRT / TFLite (FER 3-stage FP16) | Facial emotion recognition (optional) |
 | **GPIO** | RPi.GPIO (lgpio backend) | Motor and sensor control |
 | **Audio I/O** | PyAudio (capture) + pw-play (output) | Mic input + speaker output |
 | **Fallback TTS** | espeak | Offline TTS when Gemini is unavailable |
@@ -269,6 +270,7 @@ ECHOtest/
 ├── motor_controller.py      # L298N motor driver — PWM/GPIO dual mode, watchdog, atexit safety
 ├── sensor_controller.py     # HC-SR04 ultrasonic (median-filtered) + IR obstacle detection
 ├── camera_sentiment.py      # USB webcam + TFLite facial emotion analysis (adaptive backoff, EMA)
+├── camera_test.py           # Standalone camera + TFLite test utility (face detection + emotion display)
 ├── speech_engine.py         # Faster-Whisper STT (in-memory) + streaming Gemini TTS + thinking cue + volume
 ├── gemini_brain.py          # Gemini AI conversation (streaming) + hybrid NLP command interpretation + vision
 ├── gemini_live.py           # Gemini Live API engine (bidirectional audio stream)
@@ -312,18 +314,20 @@ The loop skips listening while the robot is speaking (to avoid hearing its own v
 
 1. **Microphone capture:** PyAudio opens the USB mic at its native sample rate (44100Hz for Zeb SoundMX through PipeWire). Records in 1024-sample chunks.
 
-2. **Silence detection:** Each chunk's RMS energy is computed. If RMS > 150 (configurable threshold), it's considered speech. Recording stops after 0.7 seconds of silence following speech (reduced from 1.0s for snappier response), or after 5 seconds maximum.
+2. **Silence detection:** Each chunk's RMS energy is computed. If RMS > 150 (configurable threshold), it's considered speech. Recording stops after 0.7 seconds of silence following speech (reduced from 1.0s for snappier response), or after 8 seconds maximum.
 
-3. **Whisper transcription:** The recorded PCM audio is converted to a float32 numpy array in memory and passed directly to Faster-Whisper (no temp WAV file I/O). If the source sample rate differs from 16kHz, it is resampled. Falls back to temp WAV file if in-memory transcription fails. Settings:
+3. **Whisper transcription:** The recorded PCM audio is converted to a float32 numpy array in memory and passed directly to Faster-Whisper (no temp WAV file I/O). If the source sample rate differs from 16kHz, it is resampled using scipy sinc interpolation (falls back to numpy linear interpolation if scipy is unavailable). Falls back to temp WAV file if in-memory transcription fails. Settings:
    - Model: `tiny.en` (39MB — chosen for speed on RPi4 CPU, ~2-3s per transcription)
    - Compute type: `int8` (quantized for ARM CPU)
    - Beam size: `1` (greedy decode — 10x faster than beam_size=3)
-   - VAD filter: enabled (filters out non-speech segments)
+   - VAD filter: enabled with tuned parameters (`min_silence_duration_ms=300`, `speech_pad_ms=200`, `threshold=0.35`)
    - Language: English only
 
-4. **ALSA error suppression:** Before importing PyAudio, we install a custom ALSA error handler using ctypes to suppress harmless "PCM plugin" warnings that interfere with PipeWire's ALSA compatibility layer.
+4. **Hallucination filtering:** Whisper's tiny.en model sometimes produces phantom transcriptions on silence or noise — phrases like "thank you for watching", "subscribe", single repeated words, etc. A post-transcription filter (`_HALLUCINATION_PATTERNS`) matches these known artifacts and returns empty text, preventing false command triggers.
 
-5. **Wake word gate (optional):** When `WAKE_WORD_ENABLED=True` in config, transcribed text must start with a wake phrase ("echo", "hey echo", "ok echo", "hi echo"). The wake phrase is stripped from the text before command interpretation. Non-matching speech is silently discarded. Implemented as a post-Whisper text filter rather than a pre-Whisper audio gate — Whisper already runs in ~2-3s, and adding a separate wake word model would increase latency and RAM usage on RPi 4B.
+5. **ALSA error suppression:** Before importing PyAudio, we install a custom ALSA error handler using ctypes to suppress harmless "PCM plugin" warnings that interfere with PipeWire's ALSA compatibility layer.
+
+6. **Wake word gate (optional):** When `WAKE_WORD_ENABLED=True` in config, transcribed text must start with a wake phrase ("echo", "hey echo", "ok echo", "hi echo"). The wake phrase is stripped from the text before command interpretation. Non-matching speech is silently discarded. Implemented as a post-Whisper text filter rather than a pre-Whisper audio gate — Whisper already runs in ~2-3s, and adding a separate wake word model would increase latency and RAM usage on RPi 4B.
 
 **Performance evolution:**
 
@@ -341,11 +345,11 @@ The brain has multiple functions:
 
 1. **Command interpretation** (`interpret_command`): Parses user text to determine if it's a movement command, utility command, or conversation. Uses a **priority-based keyword matching system** (see [Command Routing](#command-routing--priority-system) below). Returns one of 11 command types: `move`, `keep_moving`, `safe_move`, `patrol`, `follow`, `stop`, `goodbye`, `clear_history`, `look`, `volume`, `chat`.
 
-2. **Hybrid NLP fallback** (`interpret_command_nlp`): When local keyword matching returns `chat`, a Gemini API call classifies the phrase as a potential movement command. This catches natural language like "come ahead", "move closer", or "go that way" that local keywords miss. Only called as a fallback to avoid unnecessary API calls.
+2. **Hybrid NLP fallback** (`interpret_command_nlp`): When local keyword matching returns `chat`, a Gemini API call classifies the phrase as a potential movement command. This catches natural language like "come ahead", "move closer", or "go that way" that local keywords miss. Only called as a fallback to avoid unnecessary API calls. Results are cached for 2 seconds to avoid duplicate API calls for the same text.
 
 3. **Conversation — blocking** (`think`): Sends the user's text + detected emotion to Gemini 2.5 Flash and returns the complete response. Used as fallback when streaming is not needed.
 
-4. **Conversation — streaming** (`think_stream`): Generator that yields response sentences as they complete from Gemini. Uses `_SENTENCE_RE` regex to split on sentence boundaries (`.`, `!`, `?`). Enables the streaming think→TTS pipeline where the first sentence is spoken while subsequent ones are still generating.
+4. **Conversation — streaming** (`think_stream`): Generator that yields response sentences as they complete from Gemini. Uses `_SENTENCE_RE` regex to split on sentence boundaries (`.`, `!`, `?`, `\n`). Enables the streaming think→TTS pipeline where the first sentence is spoken while subsequent ones are still generating. Conversation history is capped at 20 entries (10 exchanges) to keep API calls lean.
 
 5. **Scene analysis** (`analyze_scene`): Sends a camera frame JPEG to Gemini vision for description. Triggered by "what do you see", "look around", etc.
 
@@ -362,7 +366,7 @@ The brain has multiple functions:
    - Emotion direction prepended (e.g., "Say this warmly and cheerfully with a smile in your voice:")
    - Output: raw PCM audio at 24kHz
 
-2. **Thinking audio cue:** Before streaming begins, `play_thinking_cue()` generates a brief ascending two-tone beep (440Hz → 660Hz, ~200ms) so the user knows ECHO heard them and is processing.
+2. **Thinking audio cue:** Before streaming begins, `play_thinking_cue()` generates a brief ascending two-tone beep (440Hz → 660Hz, ~200ms) using direct PyAudio playback (no temp file or subprocess overhead). Falls back to `_play_audio_bytes` if direct PyAudio fails. Lets the user know ECHO heard them and is processing.
 
 3. **Volume boost + user volume:** The returned audio gets a base +6dB boost (x2.0 amplitude) because Gemini TTS output tends to be quiet. On top of this, a user-adjustable volume multiplier (0.25x – 2.0x) is applied. Volume can be adjusted by voice ("louder", "volume up", "quieter", "volume down") in 25% steps.
 
@@ -455,7 +459,7 @@ A full-screen pygame animation running at 20fps on the HDMI display:
 
 1. **USB webcam** captures at 640x480 @ 15fps via OpenCV (`CAP_PROP_BUFFERSIZE=1` for fresh frames)
 2. **Haar cascade** (`haarcascade_frontalface_default.xml`) detects faces in grayscale. Results are **cached per frame** to avoid running detection twice (once for sentiment, once for follow mode).
-3. **TFLite model** (`fer_3stage_fp16.tflite`) classifies facial emotion:
+3. **TFLite model** (`fer_3stage_fp16.tflite`) classifies facial emotion via a 3-level runtime fallback chain (AI Edge LiteRT → tflite-runtime → tensorflow.lite):
    - Input: 48x48 grayscale face crop
    - Output: 7-class raw logits → softmax-normalized to probabilities (angry, disgust, fear, happy, sad, surprise, neutral)
    - Confidence threshold: 40%
@@ -595,6 +599,10 @@ source venv/bin/activate
 
 # Install Python packages
 pip install -r requirements.txt
+
+# Install TFLite runtime (recommended: AI Edge LiteRT, Google's official successor)
+pip install ai-edge-litert
+# Falls back to tflite-runtime or tensorflow.lite if unavailable
 ```
 
 ### 3. Environment Variables
@@ -902,6 +910,18 @@ Movement acknowledgments ("Moving forward!", "Stopped!") originally used `force_
 ### 17. Goodbye as a separate command type
 "Shut down" was originally in the stop keyword list, which only stopped motors. Round 4 elevated goodbye/shutdown phrases to their own command type at priority 2a (before stop), triggering a full graceful shutdown: motors stop, `_running = False` breaks the main loop, `shutdown()` speaks farewell and cleans up all subsystems in reverse order.
 
+### 18. Three-level TFLite import fallback
+Google deprecated `tflite-runtime` in favor of `ai-edge-litert`. Rather than hard-coding one package, the import chain tries all three options: `ai_edge_litert.interpreter.Interpreter` → `tflite_runtime.interpreter.Interpreter` → `tensorflow.lite.experimental.Interpreter`. If all fail, TFLite inference is disabled and the system falls back to Gemini API emotion analysis. This ensures ECHO works regardless of which TFLite package the user has installed.
+
+### 19. Whisper hallucination filtering
+Whisper's tiny.en model is fast but prone to "hallucinating" text from silence or background noise — producing phrases like "thank you for watching", "subscribe to my channel", or repeating a single word. These phantom transcriptions trigger false commands. A static set of known hallucination patterns is checked post-transcription; matches return empty text.
+
+### 20. Rate-limited Gemini emotion fallback
+When TFLite is unavailable, ECHO falls back to `analyze_emotion_from_image()` (Gemini vision API) for facial emotion detection. Without rate-limiting, this fires every listen cycle (~3-8s), wasting API quota and adding latency. A 10-second cooldown ensures the fallback only fires periodically, reusing the last detected emotion in between.
+
+### 21. NLP classification caching
+The hybrid NLP fallback (`interpret_command_nlp`) calls Gemini to classify ambiguous phrases. If the user repeats or the system re-processes the same text within 2 seconds, the cached result is returned instantly instead of making another API call. Reduces redundant Gemini calls during rapid interaction.
+
 ---
 
 ## Future Directions
@@ -956,10 +976,22 @@ Movement acknowledgments ("Moving forward!", "Stopped!") originally used `force_
 
 24. **Multi-Language Support** — **INVESTIGATED (Round 4).** Pipeline is compatible: switch Whisper from `tiny.en` to `tiny` (multilingual), set `WHISPER_LANGUAGE` to target language or `None` for auto-detect, update system prompt. Gemini chat and TTS handle multiple languages natively. Main friction: command keyword lists are English-only, but the NLP fallback via Gemini handles other languages. Config-level switch when needed.
 
+25. ~~**AI Edge LiteRT Migration**~~ — **DONE (Round 5).** Migrated TFLite inference from deprecated `tflite-runtime` to Google's official successor `ai-edge-litert`. Uses a 3-level import fallback chain: `ai_edge_litert` → `tflite_runtime` → `tensorflow.lite` → disabled. Drop-in replacement with identical `Interpreter` API. ARM64 wheels confirmed available for RPi4.
+
+26. ~~**Whisper Hallucination Filtering**~~ — **DONE (Round 5).** Added post-transcription filter that catches known Whisper tiny.en artifacts ("thank you for watching", "subscribe", single repeated words, etc.) and discards them. Prevents false command triggers from silence/noise.
+
+27. ~~**Whisper VAD Tuning & Resampling**~~ — **DONE (Round 5).** Tuned Silero VAD parameters for RPi: `min_silence_duration_ms=300`, `speech_pad_ms=200`, `threshold=0.35`. Upgraded audio resampling from numpy linear interpolation to scipy sinc interpolation (with numpy fallback).
+
+28. ~~**Latency Optimizations**~~ — **DONE (Round 5).** Four improvements: (1) Thinking cue now uses direct PyAudio playback instead of temp WAV + subprocess. (2) Gemini conversation history trimmed from 40 to 20 entries. (3) NLP classification results cached for 2 seconds. (4) Sentence splitting regex now also splits on newlines.
+
+29. ~~**Emotion Fallback Rate-Limiting**~~ — **DONE (Round 5).** Gemini API emotion fallback (used when TFLite is unavailable) now rate-limited to once per 10 seconds instead of every listen cycle. Prevents unnecessary API calls and reduces latency. Applied to both main.py and debug_main.py.
+
+30. ~~**Audio Chunk Duration Increase**~~ — **DONE (Round 5).** `AUDIO_CHUNK_DURATION` increased from 5 to 8 seconds. The previous 5-second limit was truncating longer sentences mid-speech.
+
 ### Known Limitations
 
 - **Single-language by default** — English only (Whisper tiny.en), but pipeline supports switching to multilingual mode via config (see Future Directions #24)
-- **TFLite runtime optional** — sentiment defaults to "neutral" without it; model output is softmax-normalized for correct probability interpretation
+- **TFLite runtime optional** — sentiment defaults to "neutral" without it; uses 3-level import fallback (ai-edge-litert → tflite-runtime → tensorflow.lite); model output is softmax-normalized for correct probability interpretation
 - **WiFi dependent** — Gemini API requires internet connectivity
 - **5V/3.3V mismatch** — HC-SR04 ECHO pin needs a voltage divider
 - **No rear sensors** — backward movement logs a warning but cannot detect obstacles behind the robot

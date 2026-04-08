@@ -23,7 +23,6 @@ import traceback
 from datetime import datetime
 
 import cv2
-import numpy as np
 
 # ─── Logging Setup (DEBUG level for max detail) ───
 logging.basicConfig(
@@ -328,16 +327,21 @@ class ECHODebug(ECHO):
                 confidence = self.camera.current_confidence
                 dp("EMOTION", f"Local model → {emotion} ({confidence:.0%})", C_CYAN)
 
-                # Gemini fallback for low-confidence
+                # Gemini fallback for low-confidence (rate-limited)
                 if emotion == "neutral" and confidence < 0.3:
-                    dp("EMOTION", "Low confidence — trying Gemini vision fallback...", C_YELLOW)
-                    frame_jpeg = self.camera.get_frame_jpeg()
-                    if frame_jpeg:
-                        try:
-                            emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
-                            dp("EMOTION", f"Gemini fallback → {emotion} ({confidence:.0%})", C_CYAN)
-                        except Exception as e:
-                            dp("EMOTION", f"Gemini fallback failed: {e}", C_RED)
+                    now = time.monotonic()
+                    if (now - self._last_emotion_fallback) >= self._EMOTION_FALLBACK_COOLDOWN:
+                        dp("EMOTION", "Low confidence — trying Gemini vision fallback...", C_YELLOW)
+                        frame_jpeg = self.camera.get_frame_jpeg()
+                        if frame_jpeg:
+                            try:
+                                emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
+                                self._last_emotion_fallback = now
+                                dp("EMOTION", f"Gemini fallback → {emotion} ({confidence:.0%})", C_CYAN)
+                            except Exception as e:
+                                dp("EMOTION", f"Gemini fallback failed: {e}", C_RED)
+                    else:
+                        dp("EMOTION", "Low confidence — cooldown active, skipping Gemini fallback", C_DIM)
 
                 # ── Step 2b: Update face gaze to track detected face ──
                 face_center = self.camera.get_face_center()

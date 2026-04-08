@@ -64,23 +64,35 @@ def load_tflite_model():
     input_details = None
     output_details = None
 
-    # Try tflite_runtime first (lightweight, preferred on RPi)
+    # Try runtimes in order: ai-edge-litert → tflite_runtime → tensorflow.lite
+    _Interpreter = None
     try:
-        import tflite_runtime.interpreter as tflite
-    except ImportError:
+        from ai_edge_litert.interpreter import Interpreter as _Interpreter
+        print("[OK] Using ai-edge-litert")
+    except (ImportError, AttributeError):
         try:
-            import tensorflow.lite as tflite
-        except ImportError:
-            print("[ERROR] No TFLite runtime found.")
-            print("  Install: pip install tflite-runtime")
-            return None, None, None
+            import tflite_runtime.interpreter as _tflite_mod
+            _Interpreter = _tflite_mod.Interpreter
+            print("[OK] Using tflite_runtime")
+        except (ImportError, AttributeError):
+            try:
+                import tensorflow.lite as _tflite_mod
+                _Interpreter = _tflite_mod.Interpreter
+                print("[OK] Using tensorflow.lite")
+            except (ImportError, AttributeError):
+                print("[ERROR] No TFLite runtime found.")
+                print("  Install: pip install ai-edge-litert")
+                return None, None, None
+
+    if _Interpreter is None:
+        return None, None, None
 
     if not os.path.exists(SENTIMENT_MODEL_PATH):
         print(f"[ERROR] Model not found: {SENTIMENT_MODEL_PATH}")
         return None, None, None
 
     try:
-        interpreter = tflite.Interpreter(model_path=SENTIMENT_MODEL_PATH)
+        interpreter = _Interpreter(model_path=SENTIMENT_MODEL_PATH)
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()

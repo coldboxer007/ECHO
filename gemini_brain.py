@@ -9,6 +9,7 @@ and scene understanding when needed.
 """
 
 import re
+import time
 import logging
 import threading
 from typing import Generator
@@ -17,8 +18,8 @@ logger = logging.getLogger("echo.brain")
 
 # Pre-compile regex used on every command parse
 _DURATION_RE = re.compile(r'for\s+(\d+)\s*(?:second|sec|s\b)')
-# Sentence boundary for streaming: split on . ! ? followed by space or end
-_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
+# Sentence boundary for streaming: split on . ! ? followed by space/end, OR on newlines
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+|(?<=\n)')
 
 try:
     from google import genai
@@ -38,12 +39,23 @@ class GeminiBrain:
     """Gemini-powered conversational AI with emotion awareness."""
 
     # Maximum chat history entries to keep in memory (pairs of user+model)
-    MAX_HISTORY_ENTRIES = 40  # 20 exchanges
+    # 20 entries = 10 exchanges — enough context for conversation continuity
+    # while keeping API request size manageable on RPi (fewer tokens = faster response)
+    MAX_HISTORY_ENTRIES = 20  # 10 exchanges
+
+    # NLP command classification cooldown: avoid calling Gemini NLP for every
+    # utterance classified as 'chat'. Cache the last result briefly.
+    _NLP_COOLDOWN_SECS = 2.0
 
     def __init__(self):
         self._client = None
         self._chat_history = []
         self._lock = threading.Lock()
+
+        # NLP classification cache
+        self._last_nlp_text = ""
+        self._last_nlp_result = None
+        self._last_nlp_time = 0.0
 
         self._init_client()
         logger.info("GeminiBrain initialized")
@@ -88,7 +100,7 @@ class GeminiBrain:
             # Build conversation with history (system prompt sent via config)
             messages = []
 
-            # Add conversation history (keep last 20 exchanges = 40 entries)
+            # Add conversation history (keep last 10 exchanges = 20 entries)
             with self._lock:
                 for entry in self._chat_history[-self.MAX_HISTORY_ENTRIES:]:
                     messages.append(entry)
@@ -361,12 +373,23 @@ class GeminiBrain:
         text might be a movement/action command phrased in natural language
         (e.g., "come ahead", "move closer", "go that way").
 
+        Includes a short cooldown cache to avoid redundant API calls for
+        repeated/similar utterances in quick succession.
+
         Returns:
             Same dict format as interpret_command(). Returns {'type': 'chat'}
             if Gemini determines it's just conversation.
         """
         if self._client is None:
             return {'type': 'chat', 'text': text}
+
+        # ── Cache check: return cached result if same text within cooldown ──
+        now = time.monotonic()
+        if (text == self._last_nlp_text
+                and self._last_nlp_result is not None
+                and (now - self._last_nlp_time) < self._NLP_COOLDOWN_SECS):
+            logger.debug(f"NLP cache hit for: '{text}'")
+            return self._last_nlp_result
 
         try:
             import json as _json
@@ -404,18 +427,23 @@ class GeminiBrain:
             data = _json.loads(result_text)
             cmd_type = data.get("type", "chat")
 
-            # Validate and return
+            # Validate and build result
+            result = {'type': 'chat', 'text': text}
+
             if cmd_type == "move":
                 direction = data.get("direction", "forward")
                 if direction in ("forward", "backward", "left", "right"):
-                    logger.info(f"🧠 NLP classified as move:{direction}")
-                    return {'type': 'move', 'direction': direction, 'text': text}
+                    logger.info(f"NLP classified as move:{direction}")
+                    result = {'type': 'move', 'direction': direction, 'text': text}
             elif cmd_type in ("stop", "follow", "patrol", "goodbye"):
-                logger.info(f"🧠 NLP classified as {cmd_type}")
-                return {'type': cmd_type, 'text': text}
+                logger.info(f"NLP classified as {cmd_type}")
+                result = {'type': cmd_type, 'text': text}
 
-            # Default to chat
-            return {'type': 'chat', 'text': text}
+            # Cache the result
+            self._last_nlp_text = text
+            self._last_nlp_result = result
+            self._last_nlp_time = time.monotonic()
+            return result
 
         except Exception as e:
             logger.warning(f"NLP command interpretation failed: {e}")

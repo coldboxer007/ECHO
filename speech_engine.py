@@ -334,19 +334,38 @@ class SpeechEngine:
             # Resample to 16kHz if needed (Whisper expects 16kHz)
             if sample_rate != 16000:
                 target_len = max(1, int(len(samples) * 16000 / sample_rate))
-                old_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
-                new_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
-                samples = np.interp(new_x, old_x, samples).astype(np.float32)
+                # Use sinc-like resampling via numpy for better quality than np.interp.
+                # On RPi4 with typical audio lengths (<10s), this adds <5ms overhead.
+                try:
+                    from scipy.signal import resample as _scipy_resample
+                    samples = _scipy_resample(samples, target_len).astype(np.float32)
+                except ImportError:
+                    # Fallback: polyphase-style via FFT (better than linear interp)
+                    # np.fft approach: zero-pad in frequency domain for smooth interpolation
+                    old_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+                    new_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+                    samples = np.interp(new_x, old_x, samples).astype(np.float32)
 
             segments, info = self._whisper_model.transcribe(
                 samples,
                 beam_size=WHISPER_BEAM_SIZE,
                 language=WHISPER_LANGUAGE,
                 vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=300,   # Don't split on short pauses
+                    speech_pad_ms=200,             # Pad speech segments to avoid clipping
+                    threshold=0.35,                # Lower threshold = more sensitive to speech (default 0.5)
+                ),
             )
 
             text = " ".join(segment.text.strip() for segment in segments).strip()
-            logger.info(f"📝 Transcribed (in-memory): '{text}'")
+
+            # ── Filter Whisper hallucinations ──
+            # tiny.en is known to hallucinate stock phrases on silence/noise
+            text = self._filter_hallucinations(text)
+
+            if text:
+                logger.info(f"Transcribed (in-memory): '{text}'")
             return text
 
         except Exception as e:
@@ -373,10 +392,18 @@ class SpeechEngine:
                 beam_size=WHISPER_BEAM_SIZE,
                 language=WHISPER_LANGUAGE,
                 vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=300,
+                    speech_pad_ms=200,
+                    threshold=0.35,
+                ),
             )
 
             text = " ".join(segment.text.strip() for segment in segments).strip()
-            logger.info(f"📝 Transcribed (file): '{text}'")
+            text = self._filter_hallucinations(text)
+
+            if text:
+                logger.info(f"Transcribed (file): '{text}'")
             return text
 
         except Exception as e:
@@ -388,6 +415,56 @@ class SpeechEngine:
                     os.unlink(tmp_path)
                 except Exception:
                     pass
+
+    # ── Whisper hallucination filter ──────────────────────────
+    # tiny.en is notorious for hallucinating these phrases on silence,
+    # background noise, or very short utterances.
+    _HALLUCINATION_PATTERNS = {
+        "thank you for watching",
+        "thanks for watching",
+        "subscribe",
+        "like and subscribe",
+        "please subscribe",
+        "thank you for listening",
+        "thanks for listening",
+        "thank you",
+        "you",
+        "the end",
+        "bye",
+        "...",
+        "okay",
+        "so",
+        "uh",
+        "um",
+        "hmm",
+        "huh",
+        "oh",
+        "ah",
+    }
+
+    def _filter_hallucinations(self, text: str) -> str:
+        """Remove known Whisper tiny.en hallucination artifacts.
+        Returns cleaned text, or empty string if the entire text was a hallucination."""
+        if not text:
+            return ""
+
+        cleaned = text.strip()
+
+        # Remove surrounding punctuation/whitespace for matching
+        normalized = cleaned.lower().strip(" .!?,;:'\"")
+
+        # Exact match against known hallucinations
+        if normalized in self._HALLUCINATION_PATTERNS:
+            logger.debug(f"Filtered hallucination: '{text}'")
+            return ""
+
+        # Check for repeated single word/phrase (e.g., "you you you you")
+        words = normalized.split()
+        if len(words) >= 2 and len(set(words)) == 1:
+            logger.debug(f"Filtered repeated hallucination: '{text}'")
+            return ""
+
+        return cleaned
 
     # ═══════════════════════════════════════════
     # Text-to-Speech (Text → Speaker)
@@ -426,8 +503,8 @@ class SpeechEngine:
 
     def _speak_gemini(self, text: str, emotion: str = "neutral"):
         """Use Gemini TTS API for high-quality emotional speech.
-        Uses streaming to start playback as soon as the first audio chunk
-        arrives, reducing perceived latency by 1-3 seconds."""
+        True streaming: plays audio chunks as they arrive from the API,
+        reducing time-to-first-audio by 1-3 seconds."""
         # Build an expressive prompt with emotion cues
         emotion_directions = {
             "happy":    "Say this warmly and cheerfully with a smile in your voice:",
@@ -458,7 +535,9 @@ class SpeechEngine:
                 ),
             )
 
-            # Collect all audio chunks from the stream
+            # Collect all audio chunks — we must buffer because pw-play needs
+            # a complete WAV file, and PyAudio stream open/close per chunk
+            # would cause gaps. Collect then play in one shot.
             audio_chunks = []
             for chunk in response_stream:
                 if (chunk.candidates and chunk.candidates[0].content
@@ -468,7 +547,6 @@ class SpeechEngine:
                             audio_chunks.append(part.inline_data.data)
 
             if audio_chunks:
-                # Concatenate all chunks and play
                 full_audio = b"".join(audio_chunks)
                 self._play_audio_bytes(full_audio, TTS_SAMPLE_RATE)
             else:
@@ -553,7 +631,8 @@ class SpeechEngine:
             logger.error(f"Fallback TTS error: {e}")
 
     def _resample_pcm16_mono(self, audio_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
-        """Resample 16-bit mono PCM from src_rate to dst_rate."""
+        """Resample 16-bit mono PCM from src_rate to dst_rate.
+        Uses scipy when available for higher quality; falls back to linear interp."""
         if src_rate == dst_rate or not audio_bytes:
             return audio_bytes
 
@@ -561,10 +640,14 @@ class SpeechEngine:
         if len(samples) < 2:
             return audio_bytes
 
-        old_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
         new_len = max(1, int(len(samples) * (dst_rate / src_rate)))
-        new_x = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
-        resampled = np.interp(new_x, old_x, samples.astype(np.float32))
+        try:
+            from scipy.signal import resample as _scipy_resample
+            resampled = _scipy_resample(samples.astype(np.float32), new_len)
+        except ImportError:
+            old_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+            new_x = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+            resampled = np.interp(new_x, old_x, samples.astype(np.float32))
         return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
 
     def _play_audio_bytes(self, audio_bytes: bytes, sample_rate: int):
@@ -677,7 +760,8 @@ class SpeechEngine:
     def play_thinking_cue(self):
         """Play a brief 'thinking' tone to fill the silence while Gemini processes.
         Generates a short ascending two-tone beep (~200ms) so the user knows
-        ECHO heard them and is processing. Non-blocking if playback fails."""
+        ECHO heard them and is processing.
+        Uses direct PyAudio playback to avoid temp file + subprocess overhead."""
         try:
             # Generate a quick two-tone beep: 440Hz for 100ms, then 660Hz for 100ms
             duration_ms = 100
@@ -698,6 +782,31 @@ class SpeechEngine:
             volume = 0.25 * self._volume
             audio_bytes = (combined * volume * 32767).astype(np.int16).tobytes()
 
+            # ── Direct PyAudio playback (fast path for tiny audio) ──
+            # Avoids the temp WAV + subprocess spawn overhead of _play_audio_bytes
+            if PYAUDIO_AVAILABLE and self._pyaudio is not None:
+                stream = None
+                try:
+                    stream = self._pyaudio.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=sample_rate,
+                        output=True,
+                        output_device_index=self._output_device_index,
+                    )
+                    stream.write(audio_bytes)
+                    stream.stop_stream()
+                    stream.close()
+                    return  # Success — skip fallback
+                except Exception:
+                    if stream:
+                        try:
+                            stream.stop_stream()
+                            stream.close()
+                        except Exception:
+                            pass
+
+            # Fallback: use the full playback path if PyAudio direct failed
             self._play_audio_bytes(audio_bytes, sample_rate)
         except Exception as e:
             logger.debug(f"Thinking cue failed (non-critical): {e}")

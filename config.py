@@ -85,7 +85,7 @@ WHISPER_BEAM_SIZE = 1  # Greedy decode — ~10x faster on RPi CPU (was 3, took 2
 # Audio recording settings
 AUDIO_SAMPLE_RATE = 16000  # 16kHz for Whisper
 AUDIO_CHANNELS = 1
-AUDIO_CHUNK_DURATION = 5   # Max seconds per voice command recording (was 8, too long)
+AUDIO_CHUNK_DURATION = 8   # Max seconds per voice command recording (increased from 5 — longer sentences were getting truncated)
 AUDIO_SILENCE_THRESHOLD = 150  # RMS threshold for silence detection (tuned for Zeb SoundMX USB mic)
 AUDIO_SILENCE_DURATION = 0.7   # Seconds of silence before stopping recording (was 1.0)
 
