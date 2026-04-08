@@ -23,10 +23,14 @@ import cv2
 
 # ── Config imports ──
 from config import (
-    CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS,
-    SENTIMENT_MODEL_PATH, SENTIMENT_LABELS,
+    CAMERA_INDEX,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT,
+    CAMERA_FPS,
+    SENTIMENT_MODEL_PATH,
     SENTIMENT_CONFIDENCE_THRESHOLD,
-    DISPLAY_WIDTH, DISPLAY_HEIGHT,
+    DISPLAY_WIDTH,
+    DISPLAY_HEIGHT,
     EMOTION_COLORS,
 )
 
@@ -34,18 +38,29 @@ from config import (
 # Camera is 640x480, display is 800x480
 # Left: camera feed (640x480) — exact height match
 # Right: info panel (160x480)
-CAM_W, CAM_H = CAMERA_WIDTH, CAMERA_HEIGHT    # 640, 480
-PANEL_X = CAM_W                                # 640 — where right panel starts
-PANEL_W = DISPLAY_WIDTH - CAM_W                # 160
+CAM_W, CAM_H = CAMERA_WIDTH, CAMERA_HEIGHT  # 640, 480
+PANEL_X = CAM_W  # 640 — where right panel starts
+PANEL_W = DISPLAY_WIDTH - CAM_W  # 160
 
 # Bar chart geometry inside the right panel
 BAR_LEFT = PANEL_X + 10
-BAR_WIDTH = PANEL_W - 20        # 140px
+BAR_WIDTH = PANEL_W - 20  # 140px
 BAR_HEIGHT = 22
 BAR_GAP = 6
-BAR_TOP = 120                   # Start bars below model info
+BAR_TOP = 120  # Start bars below model info
 
 WINDOW_NAME = "ECHO Camera Test"
+
+# Label order validated against emotion_test_perfect.py.
+MODEL_LABELS = [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "neutral",
+    "sad",
+    "surprise",
+]
 
 # Emotion bar colors (BGR) — derived from config's RGB tuples
 BAR_COLORS = {}
@@ -57,9 +72,11 @@ for label, rgb in EMOTION_COLORS.items():
 # TFLite loader (standalone — no ECHO class)
 # ═══════════════════════════════════════════
 
+
 def load_tflite_model():
     """Load TFLite model and return (interpreter, input_details, output_details) or Nones."""
     import os
+
     interpreter = None
     input_details = None
     output_details = None
@@ -68,15 +85,18 @@ def load_tflite_model():
     _Interpreter = None
     try:
         from ai_edge_litert.interpreter import Interpreter as _Interpreter
+
         print("[OK] Using ai-edge-litert")
     except (ImportError, AttributeError):
         try:
             import tflite_runtime.interpreter as _tflite_mod
+
             _Interpreter = _tflite_mod.Interpreter
             print("[OK] Using tflite_runtime")
         except (ImportError, AttributeError):
             try:
                 import tensorflow.lite as _tflite_mod
+
                 _Interpreter = _tflite_mod.Interpreter
                 print("[OK] Using tensorflow.lite")
             except (ImportError, AttributeError):
@@ -96,8 +116,8 @@ def load_tflite_model():
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
-        shape = input_details[0]['shape']
-        dtype = input_details[0]['dtype']
+        shape = input_details[0]["shape"]
+        dtype = input_details[0]["dtype"]
         print(f"[OK] TFLite model loaded: {SENTIMENT_MODEL_PATH}")
         print(f"     Input shape: {shape}  dtype: {dtype}")
     except Exception as e:
@@ -121,7 +141,7 @@ def load_face_detector():
 def run_inference(interpreter, input_details, output_details, face_roi):
     """Run TFLite inference on a face ROI. Returns probabilities array.
     Preprocessing matched exactly to emotion_test_perfect.py (known-good reference)."""
-    input_shape = input_details[0]['shape']  # e.g. [1, 224, 224, 3]
+    input_shape = input_details[0]["shape"]  # e.g. [1, 224, 224, 3]
     target_h, target_w = input_shape[1], input_shape[2]
 
     # Resize + BGR→RGB + raw 0-255 float32 (NO normalization — matches perfect file)
@@ -129,9 +149,9 @@ def run_inference(interpreter, input_details, output_details, face_roi):
     face_input = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB).astype(np.float32)
     face_input = np.expand_dims(face_input, axis=0)  # batch dim → (1, H, W, 3)
 
-    interpreter.set_tensor(input_details[0]['index'], face_input)
+    interpreter.set_tensor(input_details[0]["index"], face_input)
     interpreter.invoke()
-    raw = interpreter.get_tensor(output_details[0]['index'])[0]
+    raw = interpreter.get_tensor(output_details[0]["index"])[0]
 
     # Softmax if needed (matched to emotion_test_perfect.py)
     raw = raw.astype(np.float64)
@@ -145,6 +165,7 @@ def run_inference(interpreter, input_details, output_details, face_roi):
 # Drawing helpers
 # ═══════════════════════════════════════════
 
+
 def draw_face_boxes(canvas, faces, labels, confidences):
     """Draw green rectangles around faces with emotion labels."""
     for i, (x, y, w, h) in enumerate(faces):
@@ -157,56 +178,122 @@ def draw_face_boxes(canvas, faces, labels, confidences):
             # Black background for readability
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(canvas, (x, y - th - 8), (x + tw + 4, y - 2), (0, 0, 0), -1)
-            cv2.putText(canvas, text, (x + 2, y - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(
+                canvas,
+                text,
+                (x + 2, y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
 
 
-def draw_right_panel(canvas, ema_scores, fps, model_shape, face_count, top_emotion, top_conf):
+def draw_right_panel(
+    canvas, ema_scores, fps, model_shape, face_count, top_emotion, top_conf
+):
     """Draw the info panel on the right 160px strip."""
     # Dark background
-    cv2.rectangle(canvas, (PANEL_X, 0), (DISPLAY_WIDTH, DISPLAY_HEIGHT), (20, 20, 20), -1)
+    cv2.rectangle(
+        canvas, (PANEL_X, 0), (DISPLAY_WIDTH, DISPLAY_HEIGHT), (20, 20, 20), -1
+    )
     # Separator line
     cv2.line(canvas, (PANEL_X, 0), (PANEL_X, DISPLAY_HEIGHT), (60, 60, 60), 1)
 
     # ── Header ──
-    cv2.putText(canvas, "ECHO", (PANEL_X + 8, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-    cv2.putText(canvas, "Camera Test", (PANEL_X + 8, 46),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    cv2.putText(
+        canvas,
+        "ECHO",
+        (PANEL_X + 8, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 200, 255),
+        2,
+    )
+    cv2.putText(
+        canvas,
+        "Camera Test",
+        (PANEL_X + 8, 46),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (180, 180, 180),
+        1,
+    )
 
     # ── Stats ──
-    cv2.putText(canvas, f"FPS: {fps:.1f}", (PANEL_X + 8, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-    cv2.putText(canvas, f"Faces: {face_count}", (PANEL_X + 8, 88),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    cv2.putText(
+        canvas,
+        f"FPS: {fps:.1f}",
+        (PANEL_X + 8, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 255, 0),
+        1,
+    )
+    cv2.putText(
+        canvas,
+        f"Faces: {face_count}",
+        (PANEL_X + 8, 88),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (200, 200, 200),
+        1,
+    )
 
     if model_shape is not None:
         shape_str = f"Model: {model_shape[1]}x{model_shape[2]}"
-        cv2.putText(canvas, shape_str, (PANEL_X + 8, 106),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)
+        cv2.putText(
+            canvas,
+            shape_str,
+            (PANEL_X + 8, 106),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (140, 140, 140),
+            1,
+        )
 
     # ── Confidence bars ──
     y = BAR_TOP
-    for label in SENTIMENT_LABELS:
+    for label in MODEL_LABELS:
         score = ema_scores.get(label, 0.0)
         color = BAR_COLORS.get(label, (180, 180, 180))
 
         # Label text
-        cv2.putText(canvas, label[:7], (BAR_LEFT, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1)
+        cv2.putText(
+            canvas,
+            label[:7],
+            (BAR_LEFT, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (180, 180, 180),
+            1,
+        )
         y += 14
 
         # Bar background
-        cv2.rectangle(canvas, (BAR_LEFT, y), (BAR_LEFT + BAR_WIDTH, y + BAR_HEIGHT),
-                      (50, 50, 50), -1)
+        cv2.rectangle(
+            canvas,
+            (BAR_LEFT, y),
+            (BAR_LEFT + BAR_WIDTH, y + BAR_HEIGHT),
+            (50, 50, 50),
+            -1,
+        )
         # Filled portion
         fill_w = int(BAR_WIDTH * min(score, 1.0))
         if fill_w > 0:
-            cv2.rectangle(canvas, (BAR_LEFT, y), (BAR_LEFT + fill_w, y + BAR_HEIGHT),
-                          color, -1)
+            cv2.rectangle(
+                canvas, (BAR_LEFT, y), (BAR_LEFT + fill_w, y + BAR_HEIGHT), color, -1
+            )
         # Score text
-        cv2.putText(canvas, f"{score:.0%}", (BAR_LEFT + BAR_WIDTH - 38, y + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+        cv2.putText(
+            canvas,
+            f"{score:.0%}",
+            (BAR_LEFT + BAR_WIDTH - 38, y + 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+        )
 
         y += BAR_HEIGHT + BAR_GAP
 
@@ -214,32 +301,71 @@ def draw_right_panel(canvas, ema_scores, fps, model_shape, face_count, top_emoti
     thresh_x = BAR_LEFT + int(BAR_WIDTH * SENTIMENT_CONFIDENCE_THRESHOLD)
     # Draw threshold indicator on each bar position
     y_start = BAR_TOP + 14
-    for _ in SENTIMENT_LABELS:
-        cv2.line(canvas, (thresh_x, y_start), (thresh_x, y_start + BAR_HEIGHT),
-                 (0, 0, 200), 1)
+    for _ in MODEL_LABELS:
+        cv2.line(
+            canvas,
+            (thresh_x, y_start),
+            (thresh_x, y_start + BAR_HEIGHT),
+            (0, 0, 200),
+            1,
+        )
         y_start += 14 + BAR_HEIGHT + BAR_GAP
 
     # Threshold label
-    cv2.putText(canvas, f"Thresh: {SENTIMENT_CONFIDENCE_THRESHOLD:.0%}",
-                (PANEL_X + 8, y + 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 200), 1)
+    cv2.putText(
+        canvas,
+        f"Thresh: {SENTIMENT_CONFIDENCE_THRESHOLD:.0%}",
+        (PANEL_X + 8, y + 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (0, 0, 200),
+        1,
+    )
 
     # ── Current emotion (large) ──
     if top_emotion and top_conf > 0:
         y_bottom = DISPLAY_HEIGHT - 50
         color = BAR_COLORS.get(top_emotion, (180, 180, 180))
-        cv2.putText(canvas, top_emotion.upper(), (PANEL_X + 8, y_bottom),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-        cv2.putText(canvas, f"{top_conf:.0%}", (PANEL_X + 8, y_bottom + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+        cv2.putText(
+            canvas,
+            top_emotion.upper(),
+            (PANEL_X + 8, y_bottom),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+        )
+        cv2.putText(
+            canvas,
+            f"{top_conf:.0%}",
+            (PANEL_X + 8, y_bottom + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            1,
+        )
     else:
         y_bottom = DISPLAY_HEIGHT - 50
-        cv2.putText(canvas, "NO FACE", (PANEL_X + 8, y_bottom),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 2)
+        cv2.putText(
+            canvas,
+            "NO FACE",
+            (PANEL_X + 8, y_bottom),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (80, 80, 80),
+            2,
+        )
 
     # ── Quit hint ──
-    cv2.putText(canvas, "q/ESC: quit", (PANEL_X + 8, DISPLAY_HEIGHT - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+    cv2.putText(
+        canvas,
+        "q/ESC: quit",
+        (PANEL_X + 8, DISPLAY_HEIGHT - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (100, 100, 100),
+        1,
+    )
 
 
 def draw_crosshair(canvas, cam_w, cam_h):
@@ -255,6 +381,7 @@ def draw_crosshair(canvas, cam_w, cam_h):
 # Main loop
 # ═══════════════════════════════════════════
 
+
 def main():
     fullscreen = "--window" not in sys.argv
 
@@ -269,7 +396,7 @@ def main():
     # Load model
     interpreter, input_details, output_details = load_tflite_model()
     model_loaded = interpreter is not None
-    model_shape = input_details[0]['shape'] if model_loaded else None
+    model_shape = input_details[0]["shape"] if model_loaded else None
 
     # Load face detector
     face_cascade = load_face_detector()
@@ -299,14 +426,16 @@ def main():
     # Create window
     if fullscreen:
         cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
-        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setWindowProperty(
+            WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+        )
     else:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, DISPLAY_WIDTH, DISPLAY_HEIGHT)
 
     # EMA smoothing state
     ema_alpha = 0.4
-    ema_scores = {label: 0.0 for label in SENTIMENT_LABELS}
+    ema_scores = {label: 0.0 for label in MODEL_LABELS}
 
     # FPS tracking
     frame_times = []
@@ -346,22 +475,24 @@ def main():
                 # Sort by area (largest first)
                 faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
 
-                for (x, y, w, h) in faces_sorted:
-                    face_roi = frame[y:y+h, x:x+w]
-                    probs = run_inference(interpreter, input_details, output_details, face_roi)
+                for x, y, w, h in faces_sorted:
+                    face_roi = frame[y : y + h, x : x + w]
+                    probs = run_inference(
+                        interpreter, input_details, output_details, face_roi
+                    )
 
                     # EMA update (only for largest face)
                     if (x, y, w, h) == tuple(faces_sorted[0]):
-                        for i, label in enumerate(SENTIMENT_LABELS):
+                        for i, label in enumerate(MODEL_LABELS):
                             if i < len(probs):
                                 ema_scores[label] = (
-                                    ema_alpha * float(probs[i]) +
-                                    (1 - ema_alpha) * ema_scores[label]
+                                    ema_alpha * float(probs[i])
+                                    + (1 - ema_alpha) * ema_scores[label]
                                 )
 
                     # Raw top prediction for this face
                     max_idx = int(np.argmax(probs))
-                    face_labels.append(SENTIMENT_LABELS[max_idx])
+                    face_labels.append(MODEL_LABELS[max_idx])
                     face_confs.append(float(probs[max_idx]))
             elif len(faces) > 0:
                 # No model — still show face boxes
@@ -378,14 +509,15 @@ def main():
 
             # Decay EMA when no face (so bars slowly drop to zero)
             if len(faces) == 0:
-                for label in SENTIMENT_LABELS:
+                for label in MODEL_LABELS:
                     ema_scores[label] *= 0.95
 
             # ── Draw ──
             draw_face_boxes(canvas, faces, face_labels, face_confs)
             draw_crosshair(canvas, CAM_W, CAM_H)
-            draw_right_panel(canvas, ema_scores, fps, model_shape,
-                             len(faces), top_emotion, top_conf)
+            draw_right_panel(
+                canvas, ema_scores, fps, model_shape, len(faces), top_emotion, top_conf
+            )
 
             # Show
             cv2.imshow(WINDOW_NAME, canvas)
@@ -400,7 +532,7 @@ def main():
 
             # Quit on 'q' or ESC
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
+            if key == ord("q") or key == 27:
                 break
 
     except KeyboardInterrupt:
