@@ -119,44 +119,26 @@ def load_face_detector():
 
 
 def run_inference(interpreter, input_details, output_details, face_roi):
-    """Run TFLite inference on a face ROI. Returns probabilities array."""
+    """Run TFLite inference on a face ROI. Returns probabilities array.
+    Preprocessing matched exactly to emotion_test_perfect.py (known-good reference)."""
     input_shape = input_details[0]['shape']  # e.g. [1, 224, 224, 3]
     target_h, target_w = input_shape[1], input_shape[2]
-    channels = input_shape[3]
 
-    face_resized = cv2.resize(face_roi, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-    if channels == 1:
-        face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
-        face_input = face_gray.astype(np.float32) / 255.0
-        face_input = np.expand_dims(face_input, axis=-1)
-    else:
-        # Convert BGR → RGB (OpenCV captures in BGR, model trained on RGB)
-        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
-        # EfficientNet normalization: scale to [-1, 1]
-        face_input = face_rgb.astype(np.float32) / 127.5 - 1.0
-
-    face_input = np.expand_dims(face_input, axis=0)  # batch dim
-
-    input_dtype = input_details[0]['dtype']
-    face_input = face_input.astype(input_dtype)
+    # Resize + BGR→RGB + raw 0-255 float32 (NO normalization — matches perfect file)
+    face_resized = cv2.resize(face_roi, (target_w, target_h))
+    face_input = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB).astype(np.float32)
+    face_input = np.expand_dims(face_input, axis=0)  # batch dim → (1, H, W, 3)
 
     interpreter.set_tensor(input_details[0]['index'], face_input)
     interpreter.invoke()
-    output = interpreter.get_tensor(output_details[0]['index'])
+    raw = interpreter.get_tensor(output_details[0]['index'])[0]
 
-    # Model outputs softmax probabilities — do NOT apply softmax again
-    raw = output[0].astype(np.float64)
-    output_sum = np.sum(raw)
-    if abs(output_sum - 1.0) < 0.01:
-        # Already softmax — use directly
-        probs = raw
-    else:
-        # Raw logits — apply softmax
-        shifted = raw - np.max(raw)
-        exp_vals = np.exp(shifted)
-        probs = exp_vals / np.sum(exp_vals)
-    return probs
+    # Softmax if needed (matched to emotion_test_perfect.py)
+    raw = raw.astype(np.float64)
+    if raw.min() < 0 or abs(raw.sum() - 1.0) > 0.01:
+        e = np.exp(raw - raw.max())
+        raw = e / e.sum()
+    return raw
 
 
 # ═══════════════════════════════════════════
@@ -352,7 +334,7 @@ def main():
             # ── Face detection ──
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48)
             )
             faces = list(faces)
 

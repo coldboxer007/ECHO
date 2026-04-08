@@ -68,8 +68,10 @@ CAMERA_FPS = 15
 SENTIMENT_MODEL_PATH = os.path.join(
     os.path.dirname(__file__), "fer_3stage_fp16.tflite"
 )
-# Labels the TFLite model outputs — adjust to match YOUR model's label order
-SENTIMENT_LABELS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+# Labels the TFLite model outputs — order MUST match the model's output indices.
+# fer_3stage_fp16.tflite uses: 0=Angry, 1=Disgust, 2=Fear, 3=Happy, 4=Neutral, 5=Sad, 6=Surprise
+# (verified in emotion_test_perfect.py which works perfectly)
+SENTIMENT_LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 SENTIMENT_CONFIDENCE_THRESHOLD = 0.4  # Minimum confidence to use a detection
 SENTIMENT_INTERVAL = 1.0  # Seconds between sentiment reads
 

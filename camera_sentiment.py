@@ -168,7 +168,7 @@ class CameraSentiment:
             gray,
             scaleFactor=1.1,
             minNeighbors=5,
-            minSize=(80, 80),
+            minSize=(48, 48),  # Matched to emotion_test_perfect.py
         )
         result = list(faces)
 
@@ -210,45 +210,30 @@ class CameraSentiment:
             return "neutral", 0.0
 
         try:
-            # Preprocess for TFLite model
+            # ── Preprocessing: matched exactly to emotion_test_perfect.py ──
+            # That script is the known-good reference that detects emotions perfectly.
             input_shape = self._input_details[0]['shape']  # e.g., [1, 224, 224, 3]
             target_h, target_w = input_shape[1], input_shape[2]
-            channels = input_shape[3]
 
-            face_resized = cv2.resize(face_roi, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-            if channels == 1:
-                face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
-                face_input = face_gray.astype(np.float32) / 255.0
-                face_input = np.expand_dims(face_input, axis=-1)  # Add channel dim
-            else:
-                # Convert BGR → RGB (OpenCV captures in BGR, model trained on RGB)
-                face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
-                # EfficientNet normalization: scale to [-1, 1]
-                face_input = face_rgb.astype(np.float32) / 127.5 - 1.0
-
-            face_input = np.expand_dims(face_input, axis=0)  # Add batch dim
+            # Resize face ROI to model input size (default INTER_LINEAR, same as perfect file)
+            face_resized = cv2.resize(face_roi, (target_w, target_h))
+            # BGR → RGB, cast to float32, keep raw 0-255 range (NO normalization)
+            # The model was trained on raw 0-255 pixel values.
+            # Previous EfficientNet normalization (/127.5 - 1.0) was WRONG for this model.
+            face_input = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB).astype(np.float32)
+            face_input = np.expand_dims(face_input, axis=0)  # Add batch dim → (1, H, W, 3)
 
             # Run inference
-            input_dtype = self._input_details[0]['dtype']
-            face_input = face_input.astype(input_dtype)
-
             self._interpreter.set_tensor(self._input_details[0]['index'], face_input)
             self._interpreter.invoke()
-            output = self._interpreter.get_tensor(self._output_details[0]['index'])
+            raw = self._interpreter.get_tensor(self._output_details[0]['index'])[0]
 
-            # Parse output — model outputs softmax probabilities (sum ≈ 1.0)
-            # Do NOT apply softmax again; double-softmax flattens the distribution
-            raw = output[0].astype(np.float64)
-            output_sum = np.sum(raw)
-            if abs(output_sum - 1.0) < 0.01:
-                # Already softmax — use directly
-                probabilities = raw
-            else:
-                # Raw logits — apply softmax
-                shifted = raw - np.max(raw)
-                exp_vals = np.exp(shifted)
-                probabilities = exp_vals / np.sum(exp_vals)
+            # Softmax if needed (matched to emotion_test_perfect.py)
+            raw = raw.astype(np.float64)
+            if raw.min() < 0 or abs(raw.sum() - 1.0) > 0.01:
+                e = np.exp(raw - raw.max())
+                raw = e / e.sum()
+            probabilities = raw
 
             # Temporal smoothing via EMA — reduces emotion flicker from noisy frames
             for i, label in enumerate(SENTIMENT_LABELS):
