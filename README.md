@@ -253,7 +253,7 @@ The L298N controls 6 motors organized as two groups of 3 (left side + right side
 | **Python** | Python 3.13 | Runtime |
 | **STT (primary)** | Gemini 3.1 Flash Lite (cloud) | Cloud speech-to-text (~1-2s, more accurate) |
 | **STT (fallback)** | Faster-Whisper (tiny.en, int8) | Local speech-to-text (~2-3s on RPi4) |
-| **AI Brain** | Google Gemini 3.1 Flash Lite | Conversation + command understanding |
+| **AI Brain** | Google Gemini 3.1 Flash Lite | Conversation + command understanding + response emotion classification |
 | **TTS** | Gemini 2.5 Flash Preview TTS | Emotional text-to-speech (voice: Kore) |
 | **Cloud STT** | Gemini 3.1 Flash Lite (thinking disabled) | Audio transcription with zero thinking overhead |
 | **Live API** | Gemini 2.5 Flash Native Audio Preview | Alternative: bidirectional audio streaming |
@@ -364,7 +364,7 @@ The brain has multiple functions:
 
 5. **Scene analysis** (`analyze_scene`): Sends a camera frame JPEG to `gemini-robotics-er-1.5-preview` for description (with 15s timeout). If the robotics model times out or fails, falls back to the chat model with thinking disabled. Triggered by "what do you see", "look around", etc.
 
-6. **Emotion determination** (`determine_response_emotion`): Analyzes Gemini's response text for emotional keywords to choose the appropriate face animation. ECHO reacts like a real human — with its OWN emotional response, not by mirroring the user's emotion. For example, if the user is sad, ECHO responds with warmth/comfort; if the user is angry, ECHO stays calm. Falls back to neutral (not the user's emotion) when no strong emotion keywords are detected in the response text.
+6. **Emotion determination** (`determine_response_emotion`): Classifies the emotion of ECHO's response text to choose the appropriate face animation. Uses a 3-tier system: (1) **Gemini AI classification** — asks `gemini-3.1-flash-lite-preview` with `thinkingBudget=0` and `max_output_tokens=8` to return a single emotion word (fast, ~200-500ms). (2) **Expanded keyword fallback** — ~90+ keywords across all 7 emotions if Gemini fails. (3) **Neutral default**. ECHO reacts like a real human — with its OWN emotional response, not by mirroring the user's emotion. For example, if the user is sad, ECHO responds with warmth/comfort; if the user is angry, ECHO stays calm.
 
 7. **History management** (`clear_history`): Resets conversation memory on voice command.
 
@@ -1036,7 +1036,7 @@ The silence detection RMS calculation in `speech_engine.py` used `struct.unpack`
 
 21. ~~**Face Polish — Happy Eyes, Tears, Gleams**~~ — **DONE (Round 4).** Happy eyes rewritten as full round eyes with squint (not half-moon arcs). Sad emotion gets tear drops. All emotions get gleam highlights. Fear idle mouth trembles correctly. Scan lines drawn on top of face elements. CPU-safe (simple circles/lines only).
 
-22. ~~**Emotional Intelligence**~~ — **DONE (Round 4, upgraded Round 9).** ECHO reacts to the user's emotions like a real friend — with its OWN emotional response, not by mirroring. If the user is sad, ECHO shows warmth/comfort. If angry, ECHO stays calm. `determine_response_emotion()` analyzes ECHO's response text for keyword-based emotion detection and defaults to neutral (not user's emotion) when no keywords match. System prompt explicitly instructs emotional intelligence. Face shows neutral while thinking (not user's detected emotion).
+22. ~~**Emotional Intelligence**~~ — **DONE (Round 4, upgraded Round 9, Gemini classify added Round 10).** ECHO reacts to the user's emotions like a real friend — with its OWN emotional response, not by mirroring. If the user is sad, ECHO shows warmth/comfort. If angry, ECHO stays calm. `determine_response_emotion()` now uses a 3-tier system: (1) Gemini AI classification via `_classify_emotion_gemini()` — asks `gemini-3.1-flash-lite-preview` (thinkingBudget=0, max_output_tokens=8, temperature=0.0) to return a single emotion word, catching nuance that keywords miss. (2) Expanded keyword fallback via `_classify_emotion_keywords()` — ~90+ keywords across all 7 emotions. (3) Neutral default. System prompt explicitly instructs emotional intelligence. Face shows neutral while thinking (not user's detected emotion).
 
 23. ~~**Debug Camera Preview**~~ — **DONE (Round 4).** OpenCV window in debug_main.py showing live camera feed with face detection boxes, emotion label overlay, and per-emotion EMA confidence bar chart for monitoring TFLite model performance.
 
@@ -1073,6 +1073,8 @@ The silence detection RMS calculation in `speech_engine.py` used `struct.unpack`
 39. ~~**Full Gemini Live Mode with Function Calling**~~ — **DONE (Round 7).** Complete rewrite of `gemini_live.py` (~530 lines) and `live_main.py` (~310 lines). 10 function tools for full hardware control. Thread-safe queue bridge. Proper `types.Blob` API usage. Reconnection with exponential backoff. Context window compression. Periodic camera frame and emotion context injection.
 
 40. ~~**Debug Mode Inheritance Cleanup**~~ — **DONE (Round 7).** `debug_main.py` `_handle_chat` replaced: was a full copy of chat logic with synchronous TTS (no pipeline). Now delegates to `super()._handle_chat()` with debug wrappers, inheriting the producer-consumer TTS pipeline. `_CHAT_INDICATORS` uses inherited class constant instead of duplicate dict.
+
+44. ~~**Gemini-Based Emotion Classification for Face Display**~~ — **DONE (Round 10).** `determine_response_emotion()` rewritten as a 3-tier system. Primary: `_classify_emotion_gemini()` asks Gemini to classify the emotion of ECHO's response text with a single-word prompt (thinkingBudget=0, max_output_tokens=8, temperature=0.0). Tested 10/10 correct across all 7 emotions. Fallback: `_classify_emotion_keywords()` expanded from ~30 to ~90+ keywords covering all 7 emotions. Default: neutral. Added `_VALID_EMOTIONS` frozenset for validation. Fixes the bug where ECHO's face stayed neutral on responses like "That means a lot to me!" because the old keyword set didn't cover enough happy phrases.
 
 41. ~~**Gemini Cloud STT**~~ — **DONE (Round 9).** Added `_transcribe_gemini()` method to `speech_engine.py`. Sends recorded audio as WAV to `gemini-3.1-flash-lite-preview` with `thinkingBudget=0` for fast transcription (~1-2s). Falls back to local Faster-Whisper on failure. Configurable via `GEMINI_STT_ENABLED` in config.py. More accurate than local tiny.en model and comparable speed over network.
 
