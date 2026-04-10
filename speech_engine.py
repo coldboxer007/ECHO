@@ -77,15 +77,17 @@ from config import (
 class SpeechEngine:
     """Handles speech-to-text (Faster Whisper) and text-to-speech (Gemini TTS)."""
 
-    # Emotion → TTS voice direction map (shared by all TTS methods)
+    # Emotion → TTS stage-direction tags (shared by all TTS methods)
+    # Use parenthetical/asterisk stage directions so Gemini TTS interprets
+    # them as style cues rather than reading them aloud.
     _EMOTION_DIRECTIONS = {
-        "happy":    "Say this warmly and cheerfully with a smile in your voice:",
-        "sad":      "Say this gently and softly with empathy:",
-        "angry":    "Say this in a calm, reassuring tone:",
-        "surprise": "Say this with gentle excitement and wonder:",
-        "fear":     "Say this in a warm, comforting and reassuring way:",
-        "disgust":  "Say this calmly and matter-of-factly:",
-        "neutral":  "Say this in a friendly, conversational tone:",
+        "happy":    "(warmly, cheerful, smiling)",
+        "sad":      "(gently, soft, empathetic)",
+        "angry":    "(calm, reassuring, steady)",
+        "surprise": "(excited, wonder, bright)",
+        "fear":     "(warm, comforting, reassuring)",
+        "disgust":  "(calm, matter-of-fact)",
+        "neutral":  "(friendly, conversational)",
     }
 
     def __init__(self):
@@ -588,7 +590,7 @@ class SpeechEngine:
         True streaming: plays audio chunks as they arrive from the API,
         reducing time-to-first-audio by 1-3 seconds."""
         direction = self._EMOTION_DIRECTIONS.get(emotion, self._EMOTION_DIRECTIONS["neutral"])
-        prompt = f"{direction}\n\"{text}\""
+        prompt = f"{direction} {text}"
 
         try:
             # ── Streaming path: play chunks as they arrive ──
@@ -637,7 +639,7 @@ class SpeechEngine:
     def _speak_gemini_nonstream(self, text: str, emotion: str = "neutral"):
         """Non-streaming Gemini TTS fallback (original implementation)."""
         direction = self._EMOTION_DIRECTIONS.get(emotion, self._EMOTION_DIRECTIONS["neutral"])
-        prompt = f"{direction}\n\"{text}\""
+        prompt = f"{direction} {text}"
 
         response = self._genai_client.models.generate_content(
             model=GEMINI_TTS_MODEL,
@@ -829,7 +831,7 @@ class SpeechEngine:
             return None, 0
 
         direction = self._EMOTION_DIRECTIONS.get(emotion, self._EMOTION_DIRECTIONS["neutral"])
-        prompt = f"{direction}\n\"{text}\""
+        prompt = f"{direction} {text}"
 
         try:
             response_stream = self._genai_client.models.generate_content_stream(
