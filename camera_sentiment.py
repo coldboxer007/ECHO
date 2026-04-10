@@ -168,7 +168,7 @@ class CameraSentiment:
             gray,
             scaleFactor=1.1,
             minNeighbors=5,
-            minSize=(48, 48),  # Matched to emotion_test_perfect.py
+            minSize=(48, 48),
         )
         result = list(faces)
 
@@ -210,25 +210,17 @@ class CameraSentiment:
             return "neutral", 0.0
 
         try:
-            # ── Preprocessing: matched exactly to emotion_test_perfect.py ──
-            # That script is the known-good reference that detects emotions perfectly.
+            # Preprocessing matched exactly to emotion_test_perfect.py.
             input_shape = self._input_details[0]['shape']  # e.g., [1, 224, 224, 3]
             target_h, target_w = input_shape[1], input_shape[2]
-
-            # Resize face ROI to model input size (default INTER_LINEAR, same as perfect file)
             face_resized = cv2.resize(face_roi, (target_w, target_h))
-            # BGR → RGB, cast to float32, keep raw 0-255 range (NO normalization)
-            # The model was trained on raw 0-255 pixel values.
-            # Previous EfficientNet normalization (/127.5 - 1.0) was WRONG for this model.
             face_input = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB).astype(np.float32)
-            face_input = np.expand_dims(face_input, axis=0)  # Add batch dim → (1, H, W, 3)
+            face_input = np.expand_dims(face_input, axis=0)  # Add batch dim
 
-            # Run inference
             self._interpreter.set_tensor(self._input_details[0]['index'], face_input)
             self._interpreter.invoke()
             raw = self._interpreter.get_tensor(self._output_details[0]['index'])[0]
 
-            # Softmax if needed (matched to emotion_test_perfect.py)
             raw = raw.astype(np.float64)
             if raw.min() < 0 or abs(raw.sum() - 1.0) > 0.01:
                 e = np.exp(raw - raw.max())
