@@ -40,9 +40,9 @@ class GeminiBrain:
     """Gemini-powered conversational AI with emotion awareness."""
 
     # Maximum chat history entries to keep in memory (pairs of user+model)
-    # 30 entries = 15 exchanges — enough context for conversation continuity
-    # without losing important mid-conversation context.
-    MAX_HISTORY_ENTRIES = 30  # 15 exchanges
+    # 14 entries = 7 exchanges — enough context for conversation continuity
+    # while keeping API request size manageable on RPi.
+    MAX_HISTORY_ENTRIES = 14  # 7 exchanges
 
     # NLP command classification cooldown: avoid calling Gemini NLP for every
     # utterance classified as 'chat'. Cache the last result briefly.
@@ -414,6 +414,7 @@ class GeminiBrain:
                 config=types.GenerateContentConfig(
                     temperature=0.1,
                     max_output_tokens=64,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
 
@@ -447,29 +448,70 @@ class GeminiBrain:
             logger.warning(f"NLP command interpretation failed: {e}")
             return {'type': 'chat', 'text': text}
 
+    # Timeout (seconds) for scene analysis API calls to prevent hangs
+    _SCENE_ANALYSIS_TIMEOUT = 15.0
+
     def analyze_scene(self, image_bytes: bytes) -> str:
         """
-        Use Gemini Robotics-ER to analyze a camera frame.
+        Use Gemini to analyze a camera frame.
+        Tries the Robotics-ER model first (with timeout), falls back to the
+        chat model if the robotics model hangs or errors.
         Returns a text description of the scene.
         """
         if self._client is None:
             return "Cannot analyze scene — no Gemini client"
 
+        prompt = "Briefly describe what you see. If there are people, describe their posture and approximate position."
+
+        # Try robotics model with timeout to prevent _handle_look() hangs
+        result = [None]
+        error = [None]
+
+        def _call_robotics():
+            try:
+                response = self._client.models.generate_content(
+                    model=GEMINI_ROBOTICS_MODEL,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.5,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                result[0] = response.text.strip()
+            except Exception as e:
+                error[0] = e
+
+        t = threading.Thread(target=_call_robotics, daemon=True)
+        t.start()
+        t.join(timeout=self._SCENE_ANALYSIS_TIMEOUT)
+
+        if t.is_alive():
+            logger.warning(f"Scene analysis timed out after {self._SCENE_ANALYSIS_TIMEOUT}s — trying chat model")
+        elif error[0]:
+            logger.warning(f"Robotics model error: {error[0]} — trying chat model")
+        elif result[0]:
+            return result[0]
+
+        # Fallback: use the chat model (faster, thinking disabled for speed)
         try:
             response = self._client.models.generate_content(
-                model=GEMINI_ROBOTICS_MODEL,
+                model=GEMINI_CHAT_MODEL,
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'),
-                    "Briefly describe what you see. If there are people, describe their posture and approximate position."
+                    prompt,
                 ],
                 config=types.GenerateContentConfig(
                     temperature=0.5,
+                    max_output_tokens=256,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
             return response.text.strip()
         except Exception as e:
-            logger.error(f"Scene analysis error: {e}")
+            logger.error(f"Scene analysis fallback error: {e}")
             return ""
 
     def detect_person_position(self, image_bytes: bytes) -> dict:
@@ -541,6 +583,7 @@ class GeminiBrain:
                 config=types.GenerateContentConfig(
                     temperature=0.2,
                     max_output_tokens=64,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
 
@@ -567,25 +610,44 @@ class GeminiBrain:
 
     def determine_response_emotion(self, response_text: str, user_emotion: str) -> str:
         """
-        Pick an appropriate display emotion for the robot's spoken response.
-        Analyzes keywords in the response to choose the best facial expression.
-        Prioritizes matching the response content; mirrors user emotion for empathy;
-        defaults to neutral so the face doesn't appear stuck in one expression.
+        Pick ECHO's own emotional display for its response.
+        ECHO reacts like a human would — not by mirroring the user's emotion,
+        but by responding appropriately to the *content* of its own words.
+
+        Keyword analysis of ECHO's response text determines the face expression.
+        Falls back to 'neutral' when no strong emotion is detected in the text,
+        so ECHO doesn't accidentally mirror the user's sadness/anger on its face.
         """
         text = response_text.lower()
 
-        if any(w in text for w in ['sorry', 'sad', 'unfortunate', 'tough', 'difficult', 'condolence']):
+        # Empathetic concern — ECHO's face shows compassion, not sadness-mirroring
+        if any(w in text for w in ['sorry', 'sad', 'unfortunate', 'tough', 'difficult',
+                                    'condolence', 'miss you', 'loss', 'hurts']):
             return 'sad'
-        if any(w in text for w in ['happy', 'glad', 'great', 'wonderful', 'love', 'fantastic', 'awesome', 'exciting']):
+        # Warmth and positivity — ECHO genuinely shares good feelings
+        if any(w in text for w in ['happy', 'glad', 'great', 'wonderful', 'love',
+                                    'fantastic', 'awesome', 'exciting', 'proud',
+                                    'congratulations', 'nice', 'fun', 'enjoy']):
             return 'happy'
-        if any(w in text for w in ['wow', 'amazing', 'incredible', 'surprising', 'no way']):
+        # Genuine surprise or fascination
+        if any(w in text for w in ['wow', 'amazing', 'incredible', 'surprising',
+                                    'no way', 'really', 'whoa', 'fascinating']):
             return 'surprise'
-        if any(w in text for w in ['careful', 'danger', 'worried', 'scary', 'afraid']):
+        # Concerned/protective
+        if any(w in text for w in ['careful', 'danger', 'worried', 'scary', 'afraid',
+                                    'warning', 'watch out', 'be safe']):
             return 'fear'
+        # Frustration or disapproval (rare but possible)
+        if any(w in text for w in ['frustrat', 'annoying', 'unfair', 'ridiculous']):
+            return 'angry'
+        # Mild disgust/discomfort
+        if any(w in text for w in ['gross', 'disgusting', 'yuck', 'ew', 'unpleasant']):
+            return 'disgust'
 
-        # Mirror user's emotion for empathy; default to neutral (not happy)
-        # so the face naturally reflects context rather than always smiling.
-        return user_emotion
+        # Default: neutral expression. Do NOT mirror the user's emotion — ECHO
+        # should express its own reaction, and when the text doesn't convey strong
+        # emotion, a calm neutral face is the most natural response.
+        return 'neutral'
 
     def clear_history(self):
         """Clear conversation history."""

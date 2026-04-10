@@ -1,7 +1,8 @@
 """
 ECHO Robot — Speech Engine
 ============================
-Speech-to-Text:  Faster-Whisper (lightweight, runs locally on RPi CPU)
+Speech-to-Text:  Gemini Cloud STT (primary — fast, accurate, uses API)
+                 Faster-Whisper (fallback — runs locally on RPi CPU)
 Text-to-Speech:  Gemini TTS API (high-quality, emotional voice output)
                  Falls back to espeak if Gemini TTS is unavailable.
 
@@ -64,7 +65,7 @@ except ImportError:
     logger.warning("google-genai not available — TTS will use fallback")
 
 from config import (
-    GEMINI_API_KEY, GEMINI_TTS_MODEL,
+    GEMINI_API_KEY, GEMINI_TTS_MODEL, GEMINI_STT_MODEL, GEMINI_STT_ENABLED,
     WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE,
     WHISPER_LANGUAGE, WHISPER_BEAM_SIZE,
     AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_CHUNK_DURATION,
@@ -241,7 +242,7 @@ class SpeechEngine:
     def listen(self) -> str:
         """
         Record audio from microphone until silence is detected,
-        then transcribe with Faster Whisper.
+        then transcribe — Gemini cloud STT first, Whisper fallback.
         Returns the transcribed text, or empty string on failure.
         """
         if not PYAUDIO_AVAILABLE or self._pyaudio is None:
@@ -340,7 +341,74 @@ class SpeechEngine:
             return b"", selected_rate
 
     def _transcribe(self, audio_data: bytes, sample_rate: int) -> str:
-        """Transcribe raw PCM audio bytes using Faster Whisper.
+        """Transcribe recorded audio — tries Gemini cloud STT first for speed
+        and accuracy, falls back to local Whisper if Gemini is unavailable or fails."""
+
+        # ── Primary: Gemini Cloud STT (faster + more accurate than tiny.en) ──
+        if GEMINI_STT_ENABLED and self._genai_client is not None:
+            text = self._transcribe_gemini(audio_data, sample_rate)
+            if text:
+                return text
+            logger.info("Gemini STT returned empty — falling back to local Whisper")
+
+        # ── Fallback: Local Whisper STT ──
+        return self._transcribe_whisper(audio_data, sample_rate)
+
+    def _transcribe_gemini(self, audio_data: bytes, sample_rate: int) -> str:
+        """Transcribe audio using Gemini API (cloud STT).
+        Sends recorded audio as WAV to Gemini for transcription.
+        Much more accurate than local Whisper tiny.en with comparable speed over network.
+        Returns transcribed text, or empty string on failure."""
+        import io
+
+        try:
+            # Wrap raw PCM16 in WAV format for Gemini
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wf:
+                wf.setnchannels(AUDIO_CHANNELS)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_data)
+            wav_bytes = wav_buffer.getvalue()
+
+            response = self._genai_client.models.generate_content(
+                model=GEMINI_STT_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav'),
+                    "Transcribe this audio exactly as spoken. Return ONLY the spoken words — "
+                    "no timestamps, no labels, no commentary. If no speech is detected, "
+                    "return exactly: [SILENCE]"
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=256,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+
+            text = response.text.strip()
+
+            # Clean up any quotes or markdown Gemini might wrap the text in
+            if text.startswith('"') and text.endswith('"'):
+                text = text[1:-1].strip()
+            if text.startswith("'") and text.endswith("'"):
+                text = text[1:-1].strip()
+            if text.startswith('`') and text.endswith('`'):
+                text = text[1:-1].strip()
+
+            # Detect silence marker
+            if not text or text.upper() == "[SILENCE]" or text.upper() == "SILENCE":
+                return ""
+
+            logger.info(f"Gemini STT: '{text}'")
+            return text
+
+        except Exception as e:
+            logger.warning(f"Gemini STT failed: {e}")
+            return ""
+
+    def _transcribe_whisper(self, audio_data: bytes, sample_rate: int) -> str:
+        """Transcribe raw PCM audio bytes using Faster Whisper (local CPU).
         Uses in-memory numpy array when possible (avoids temp file I/O).
         Falls back to temp WAV if in-memory transcription fails."""
         if self._whisper_model is None:

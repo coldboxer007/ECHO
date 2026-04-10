@@ -329,19 +329,30 @@ class ECHODebug(ECHO):
                 confidence = self.camera.current_confidence
                 dp("EMOTION", f"Local model → {emotion} ({confidence:.0%})", C_CYAN)
 
-                # Gemini fallback for low-confidence (rate-limited)
+                # Check if a background emotion fallback completed
+                if self._bg_emotion_result is not None:
+                    emotion, confidence = self._bg_emotion_result
+                    self._bg_emotion_result = None
+                    dp("EMOTION", f"Background fallback result → {emotion} ({confidence:.0%})", C_CYAN)
+
+                # Launch async fallback if confidence is low (rate-limited)
                 if emotion == "neutral" and confidence < 0.3:
                     now = time.monotonic()
                     if (now - self._last_emotion_fallback) >= self._EMOTION_FALLBACK_COOLDOWN:
-                        dp("EMOTION", "Low confidence — trying Gemini vision fallback...", C_YELLOW)
+                        dp("EMOTION", "Low confidence — launching async Gemini vision fallback...", C_YELLOW)
+                        self._last_emotion_fallback = now
                         frame_jpeg = self.camera.get_frame_jpeg()
                         if frame_jpeg:
-                            try:
-                                emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
-                                self._last_emotion_fallback = now
-                                dp("EMOTION", f"Gemini fallback → {emotion} ({confidence:.0%})", C_CYAN)
-                            except Exception as e:
-                                dp("EMOTION", f"Gemini fallback failed: {e}", C_RED)
+                            def _bg_emotion_fallback(img):
+                                try:
+                                    result = self.brain.analyze_emotion_from_image(img)
+                                    self._bg_emotion_result = result
+                                except Exception as e:
+                                    dp("EMOTION", f"Background emotion fallback failed: {e}", C_RED)
+                            threading.Thread(
+                                target=_bg_emotion_fallback, args=(frame_jpeg,),
+                                daemon=True,
+                            ).start()
                     else:
                         dp("EMOTION", "Low confidence — cooldown active, skipping Gemini fallback", C_DIM)
 

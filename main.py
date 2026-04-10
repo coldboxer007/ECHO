@@ -50,6 +50,10 @@ class ECHO:
     # Minimum seconds between Gemini vision emotion fallback API calls
     _EMOTION_FALLBACK_COOLDOWN = 10.0
 
+    # Background emotion fallback result — updated by a daemon thread
+    # so the main loop never blocks on a Gemini vision API call.
+    _bg_emotion_result = None  # tuple (emotion, confidence) or None
+
     # Words/phrases that indicate the input is conversation, not a movement command.
     # Used to skip expensive Gemini NLP classification for obvious chat.
     _CHAT_INDICATORS = frozenset({
@@ -181,20 +185,34 @@ class ECHO:
                 logger.info(f"User said: '{user_text}'")
 
                 # ── Step 2: Get current emotion from camera ──
-                # Use local TFLite model; fall back to Gemini vision if low confidence
-                # (rate-limited to avoid wasteful API calls every listen cycle)
+                # Use local TFLite model; fire off async Gemini vision fallback if
+                # confidence is low. Never blocks the main loop for an API call.
                 emotion = self.camera.current_emotion
                 confidence = self.camera.current_confidence
+
+                # Check if a background emotion fallback completed
+                if self._bg_emotion_result is not None:
+                    emotion, confidence = self._bg_emotion_result
+                    self._bg_emotion_result = None
+                    logger.info(f"Using background emotion fallback: {emotion} ({confidence:.0%})")
+
+                # Launch async fallback if confidence is low (rate-limited)
                 if emotion == "neutral" and confidence < 0.3:
                     now = time.monotonic()
                     if (now - self._last_emotion_fallback) >= self._EMOTION_FALLBACK_COOLDOWN:
+                        self._last_emotion_fallback = now
                         frame_jpeg = self.camera.get_frame_jpeg()
                         if frame_jpeg:
-                            try:
-                                emotion, confidence = self.brain.analyze_emotion_from_image(frame_jpeg)
-                                self._last_emotion_fallback = now
-                            except Exception as e:
-                                logger.debug(f"Gemini emotion fallback failed: {e}")
+                            def _bg_emotion_fallback(img):
+                                try:
+                                    result = self.brain.analyze_emotion_from_image(img)
+                                    self._bg_emotion_result = result
+                                except Exception as e:
+                                    logger.debug(f"Background emotion fallback failed: {e}")
+                            threading.Thread(
+                                target=_bg_emotion_fallback, args=(frame_jpeg,),
+                                daemon=True,
+                            ).start()
                 logger.info(f"😊 Detected emotion: {emotion} ({confidence:.0%})")
 
                 # ── Step 2b: Update face gaze to track detected face ──
@@ -310,7 +328,13 @@ class ECHO:
         direction = command.get('direction', 'forward')
         logger.info(f"🔄 Starting continuous {direction} movement")
         self.face.set_emotion("neutral")
-        self.speech.speak(f"Moving {direction}. Say stop to halt.", emotion="neutral")
+        # Speak async — start moving immediately, don't wait for TTS
+        ack_thread = threading.Thread(
+            target=self.speech.speak,
+            args=(f"Moving {direction}. Say stop to halt.",),
+            kwargs={'emotion': 'neutral'}, daemon=True,
+        )
+        ack_thread.start()
         self.nav.start_continuous_move(direction)
 
     def _handle_safe_move(self, command: dict):
@@ -318,7 +342,13 @@ class ECHO:
         direction = command.get('direction', 'forward')
         logger.info(f"🛡️ Safe move: {direction} with obstacle checking")
         self.face.set_emotion("neutral")
-        self.speech.speak(f"Moving carefully. I'll stop if I see an obstacle.", emotion="neutral")
+        # Speak async — start moving immediately
+        ack_thread = threading.Thread(
+            target=self.speech.speak,
+            args=("Moving carefully. I'll stop if I see an obstacle.",),
+            kwargs={'emotion': 'neutral'}, daemon=True,
+        )
+        ack_thread.start()
         # safe_forward now runs in background — non-blocking so robot stays responsive
         self.nav.safe_forward(duration=8.0)
 
@@ -326,13 +356,25 @@ class ECHO:
         """Handle patrol / back-and-forth movement."""
         logger.info("🔄 Starting patrol mode")
         self.face.set_emotion("happy")
-        self.speech.speak("Patrolling! Say stop when you want me to halt.", emotion="happy")
+        # Speak async — start patrol immediately
+        ack_thread = threading.Thread(
+            target=self.speech.speak,
+            args=("Patrolling! Say stop when you want me to halt.",),
+            kwargs={'emotion': 'happy'}, daemon=True,
+        )
+        ack_thread.start()
         self.nav.start_patrol()
 
     def _handle_follow(self):
         """Handle follow-me command."""
         self.face.set_emotion("happy")
-        self.speech.speak("I'll follow you! Say stop when you want me to stop.", emotion="happy")
+        # Speak async — start follow immediately
+        ack_thread = threading.Thread(
+            target=self.speech.speak,
+            args=("I'll follow you! Say stop when you want me to stop.",),
+            kwargs={'emotion': 'happy'}, daemon=True,
+        )
+        ack_thread.start()
         self.nav.start_follow()
 
     def _handle_stop(self):
@@ -406,8 +448,10 @@ class ECHO:
         Because TTS generation (~1-3s) overlaps with audio playback (~1-3s),
         sentences after the first play with near-zero gap between them.
         """
-        # Show detected user emotion while thinking
-        self.face.set_emotion(emotion)
+        # Show neutral/attentive expression while processing — NOT the user's emotion.
+        # ECHO should display its OWN reaction, which isn't determined until we see
+        # the response text. Showing the user's emotion here would be mirroring.
+        self.face.set_emotion("neutral")
 
         # "Thinking" state — distinct from talking (eyes look up, processing look)
         self.face.set_state("thinking")

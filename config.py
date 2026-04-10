@@ -14,9 +14,11 @@ load_dotenv()
 # Gemini API
 # ─────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_CHAT_MODEL = "gemini-2.5-flash"  # For conversation
-GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"     # For text-to-speech
-GEMINI_ROBOTICS_MODEL = "gemini-robotics-er-1.5-preview"  # For vision/spatial
+GEMINI_CHAT_MODEL = "gemini-3.1-flash-lite-preview"  # For conversation (fastest 3.x, supports text+image+audio)
+GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"     # For text-to-speech (only TTS-capable model available)
+GEMINI_ROBOTICS_MODEL = "gemini-robotics-er-1.5-preview"  # For vision/spatial (specialized, no 3.x equivalent)
+GEMINI_STT_MODEL = "gemini-3.1-flash-lite-preview"   # For cloud speech-to-text (same as chat — fast, verified audio support)
+GEMINI_STT_ENABLED = True  # True = use Gemini cloud STT (faster + more accurate), falls back to local Whisper on failure
 
 # ─────────────────────────────────────────────
 # L298N Motor Driver (BOARD pin numbers)
@@ -148,8 +150,12 @@ Conversation guidelines:
 - Speak naturally in 2-4 sentences. Be conversational, not robotic.
 - Give thoughtful, engaging answers with personality and warmth.
 - Remember and reference things said earlier in the conversation — this makes you feel real.
-- If someone seems sad, be comforting. If happy, share their joy. If angry, be calm and understanding.
+- React to emotions like a real friend would — with your OWN emotional response, not by copying theirs:
+  - If someone is sad, be warm, comforting, and supportive — like a caring friend.
+  - If someone is happy, share their excitement and celebrate with them.
+  - If someone is angry, stay calm and understanding first — help them feel heard.
+  - If someone is scared, be reassuring and protective.
 - You are curious, helpful, and genuinely enjoy chatting with people.
-- When you see an emotion tag like [EMOTION: happy], subtly adapt your tone to match.
+- When you see an emotion tag like [EMOTION: sad], respond with empathy — but express YOUR feelings about their situation, not a copy of theirs.
 - Never say you're an AI, a language model, or that you can't feel emotions — you are ECHO.
 - Keep responses concise enough to speak aloud (avoid long lists or code)."""
