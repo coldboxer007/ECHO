@@ -608,45 +608,111 @@ class GeminiBrain:
             logger.error(f"Gemini emotion analysis error: {e}")
             return "neutral", 0.0
 
+    # Valid emotions for face display (must match face_display.py)
+    _VALID_EMOTIONS = frozenset({'happy', 'sad', 'angry', 'surprise', 'fear', 'disgust', 'neutral'})
+
     def determine_response_emotion(self, response_text: str, user_emotion: str) -> str:
         """
         Pick ECHO's own emotional display for its response.
         ECHO reacts like a human would — not by mirroring the user's emotion,
         but by responding appropriately to the *content* of its own words.
 
-        Keyword analysis of ECHO's response text determines the face expression.
-        Falls back to 'neutral' when no strong emotion is detected in the text,
-        so ECHO doesn't accidentally mirror the user's sadness/anger on its face.
+        Strategy:
+          1. Ask Gemini to classify the emotion of ECHO's response text (fast,
+             thinking disabled, tiny output). This catches nuance that keywords miss.
+          2. If Gemini fails or returns an invalid emotion, fall back to keyword
+             matching across all 7 emotions.
+          3. Default to 'neutral' if nothing matches.
         """
+        # ── Primary: Gemini-based emotion classification ──
+        gemini_emotion = self._classify_emotion_gemini(response_text)
+        if gemini_emotion:
+            return gemini_emotion
+
+        # ── Fallback: keyword-based classification ──
+        return self._classify_emotion_keywords(response_text)
+
+    def _classify_emotion_gemini(self, response_text: str) -> str:
+        """Use Gemini to classify the emotional tone of ECHO's response text.
+        Returns a valid emotion string, or empty string on failure."""
+        if self._client is None:
+            return ""
+
+        try:
+            response = self._client.models.generate_content(
+                model=GEMINI_CHAT_MODEL,
+                contents=(
+                    "What emotion does this sentence convey? "
+                    "Reply with ONLY one word from: happy, sad, angry, surprise, fear, disgust, neutral.\n\n"
+                    f'"{response_text}"'
+                ),
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=8,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+
+            emotion = response.text.strip().lower().rstrip('.')
+            if emotion in self._VALID_EMOTIONS:
+                logger.info(f"Gemini emotion classify: '{response_text[:50]}...' → {emotion}")
+                return emotion
+
+            logger.debug(f"Gemini emotion classify returned invalid: '{emotion}'")
+            return ""
+
+        except Exception as e:
+            logger.debug(f"Gemini emotion classify failed: {e}")
+            return ""
+
+    @staticmethod
+    def _classify_emotion_keywords(response_text: str) -> str:
+        """Keyword-based emotion classification — fallback when Gemini is unavailable.
+        Checks ECHO's response text for emotion-indicator words across all 7 emotions."""
         text = response_text.lower()
 
-        # Empathetic concern — ECHO's face shows compassion, not sadness-mirroring
+        # Empathetic concern — ECHO shows compassion
         if any(w in text for w in ['sorry', 'sad', 'unfortunate', 'tough', 'difficult',
-                                    'condolence', 'miss you', 'loss', 'hurts']):
+                                    'condolence', 'miss you', 'loss', 'hurts', 'heartbreak',
+                                    'painful', 'griev', 'lonely', 'cry', 'tear', 'sigh',
+                                    'regret', 'disappoint', 'broke my heart']):
             return 'sad'
-        # Warmth and positivity — ECHO genuinely shares good feelings
+        # Warmth and positivity — ECHO shares good feelings
         if any(w in text for w in ['happy', 'glad', 'great', 'wonderful', 'love',
                                     'fantastic', 'awesome', 'exciting', 'proud',
-                                    'congratulations', 'nice', 'fun', 'enjoy']):
+                                    'congratulations', 'nice', 'fun', 'enjoy',
+                                    'thank', 'appreciate', 'sweet', 'kind',
+                                    'means a lot', 'touched', 'honored', 'honour',
+                                    'delighted', 'thrilled', 'pleasure', 'excellent',
+                                    'brilliant', 'perfect', 'yay', 'warm', 'care about',
+                                    'cheer', 'smile', 'haha', 'lol', 'good job',
+                                    'well done', 'bravo', 'hooray']):
             return 'happy'
         # Genuine surprise or fascination
         if any(w in text for w in ['wow', 'amazing', 'incredible', 'surprising',
-                                    'no way', 'really', 'whoa', 'fascinating']):
+                                    'no way', 'really', 'whoa', 'fascinating',
+                                    'unbelievable', 'mind-blowing', 'astonish',
+                                    'unexpected', 'shock', 'oh my', 'can\'t believe']):
             return 'surprise'
         # Concerned/protective
         if any(w in text for w in ['careful', 'danger', 'worried', 'scary', 'afraid',
-                                    'warning', 'watch out', 'be safe']):
+                                    'warning', 'watch out', 'be safe', 'nervous',
+                                    'anxious', 'terrif', 'fright', 'creepy', 'eerie',
+                                    'spooky', 'uneasy', 'panic']):
             return 'fear'
-        # Frustration or disapproval (rare but possible)
-        if any(w in text for w in ['frustrat', 'annoying', 'unfair', 'ridiculous']):
+        # Frustration or disapproval
+        if any(w in text for w in ['frustrat', 'annoying', 'unfair', 'ridiculous',
+                                    'furious', 'outrage', 'mad', 'anger', 'hate',
+                                    'unacceptable', 'infuriat', 'irrit', 'rage',
+                                    'fed up', 'sick of']):
             return 'angry'
         # Mild disgust/discomfort
-        if any(w in text for w in ['gross', 'disgusting', 'yuck', 'ew', 'unpleasant']):
+        if any(w in text for w in ['gross', 'disgusting', 'yuck', 'ew', 'unpleasant',
+                                    'nasty', 'revolting', 'repulsive', 'horrible smell',
+                                    'vile', 'nauseating', 'ugh', 'blegh', 'cringe']):
             return 'disgust'
 
-        # Default: neutral expression. Do NOT mirror the user's emotion — ECHO
-        # should express its own reaction, and when the text doesn't convey strong
-        # emotion, a calm neutral face is the most natural response.
+        # Default: neutral — text doesn't convey strong emotion
         return 'neutral'
 
     def clear_history(self):
