@@ -313,13 +313,17 @@ class GeminiBrain:
             duration = float(dur_match.group(1))
 
         # ── PRIORITY 4: Standard movement commands ──
+        # NOTE: Only multi-word phrases here. Bare words like 'right', 'back',
+        # 'left', 'forward' cause false triggers in conversational phrases
+        # ("all right", "I take it back", "nothing left", "looking forward to").
+        # Single-word directional commands are handled by the NLP fallback.
         move_keywords = {
-            'forward':  ['move forward', 'go forward', 'go ahead', 'drive forward', 'move ahead',
-                         'forward', 'straight', 'go straight', 'advance'],
-            'backward': ['move backward', 'go backward', 'go back', 'reverse', 'move back',
-                         'back up', 'backward', 'backwards', 'back'],
-            'left':     ['turn left', 'go left', 'rotate left', 'spin left', 'left'],
-            'right':    ['turn right', 'go right', 'rotate right', 'spin right', 'right'],
+            'forward':  ['move forward', 'go forward', 'go ahead', 'drive forward',
+                         'move ahead', 'go straight'],
+            'backward': ['move backward', 'go backward', 'go back', 'reverse',
+                         'move back', 'back up'],
+            'left':     ['turn left', 'go left', 'rotate left', 'spin left'],
+            'right':    ['turn right', 'go right', 'rotate right', 'spin right'],
         }
 
         for direction, keywords in move_keywords.items():

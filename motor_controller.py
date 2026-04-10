@@ -229,8 +229,9 @@ class MotorController:
         with self._lock:
             self.running = True
             self._move_start_time = time.time()
-        # Wiring swapped: IN1=LEFT BWD, IN4=RIGHT FWD
-        self._set_motors(True, False, False, True)
+        # Left/right motor groups are physically swapped on chassis
+        # IN2=LEFT FWD (actually right wheels), IN3=RIGHT BWD (actually left wheels)
+        self._set_motors(False, True, True, False)
         if duration:
             self._timed_stop(duration)
 
@@ -243,8 +244,9 @@ class MotorController:
         with self._lock:
             self.running = True
             self._move_start_time = time.time()
-        # Wiring swapped: IN2=LEFT FWD, IN3=RIGHT BWD
-        self._set_motors(False, True, True, False)
+        # Left/right motor groups are physically swapped on chassis
+        # IN1=LEFT BWD (actually right wheels), IN4=RIGHT FWD (actually left wheels)
+        self._set_motors(True, False, False, True)
         if duration:
             self._timed_stop(duration)
 
@@ -281,22 +283,24 @@ class MotorController:
                         pass
 
     def slight_left(self, speed: int = None):
-        """Gentle left correction for follow mode — right forward only."""
+        """Gentle left correction for follow mode — left forward only (physically right wheels)."""
         if speed is not None:
             self._speed = max(0, min(100, speed))
         with self._lock:
             self.running = True
             self._move_start_time = time.time()
-        self._set_motors(False, False, False, True)
+        # Motor groups physically swapped: IN2 (labeled left) drives right wheels
+        self._set_motors(False, True, False, False)
 
     def slight_right(self, speed: int = None):
-        """Gentle right correction for follow mode — left forward only."""
+        """Gentle right correction for follow mode — right forward only (physically left wheels)."""
         if speed is not None:
             self._speed = max(0, min(100, speed))
         with self._lock:
             self.running = True
             self._move_start_time = time.time()
-        self._set_motors(False, True, False, False)
+        # Motor groups physically swapped: IN4 (labeled right) drives left wheels
+        self._set_motors(False, False, False, True)
 
     # ── Cleanup ──
 
